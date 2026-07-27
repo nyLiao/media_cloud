@@ -27,10 +27,21 @@ uv run mc-pipeline init-db --db data/mc.db
 ```bash
 uv run pytest
 uv run ruff check .
+uv run ruff format --check .
 uv run mypy src
 ```
 
-The current implementation establishes repository configuration and the versioned SQLite
-schema. Search, article acquisition, LLM extraction, and CSV export are implemented in later
-pipeline stages described in `PLAN.md`.
+`ruff format` also formats Python blocks inside Markdown, so code samples in `PLAN.md` are
+part of the gate.
 
+The current implementation establishes repository configuration, the versioned SQLite schema,
+deterministic hashing and identifiers (`identity.py`), and the config-derived extraction
+contract (`contracts.py`). Search, article acquisition, LLM extraction, and CSV export are
+implemented in later pipeline stages described in `PLAN.md`.
+
+`config/topics.yaml` drives behaviour: `extraction.fields` alone determines the JSON Schema
+sent to the model, the validation model, and the exported CSV columns, so adding a field is a
+YAML edit with no code change.
+
+Media Cloud and LLM query timeouts are configured separately and validated at a minimum of
+300 seconds (five minutes).

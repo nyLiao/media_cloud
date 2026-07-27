@@ -7,7 +7,8 @@ import pytest
 from typer.testing import CliRunner
 
 from mc_pipeline.cli import app
-from mc_pipeline.db import SCHEMA_VERSION, init_db
+from mc_pipeline.db import BUSY_TIMEOUT_MS, SCHEMA_VERSION, init_db
+from mc_pipeline.errors import DatabaseError
 
 
 def test_init_db_creates_schema(tmp_path):
@@ -21,6 +22,7 @@ def test_init_db_creates_schema(tmp_path):
             "pipeline_runs",
             "search_windows",
             "stories",
+            "story_topic_state",
             "search_hits",
             "articles",
             "fetch_attempts",
@@ -29,6 +31,134 @@ def test_init_db_creates_schema(tmp_path):
             "cases",
         } <= tables
         assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    finally:
+        connection.close()
+
+
+def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def test_stories_holds_no_topic_scoped_verdicts(tmp_path):
+    """QC and dedup verdicts depend on topic config, so they cannot live on stories."""
+    connection = init_db(tmp_path / "pipeline.db")
+    try:
+        story_columns = _columns(connection, "stories")
+        assert not story_columns & {"qc_status", "qc_reason", "dup_of_story_id"}
+        assert {"qc_status", "qc_reason", "dup_of_story_id"} <= _columns(
+            connection, "story_topic_state"
+        )
+    finally:
+        connection.close()
+
+
+def test_two_topics_hold_independent_qc_verdicts_for_one_story(tmp_path):
+    connection = init_db(tmp_path / "pipeline.db")
+    try:
+        connection.executemany(
+            "INSERT INTO stories(story_id, raw_json) VALUES (?, '{}')",
+            [("story-1",), ("story-2",)],
+        )
+        connection.executemany(
+            """
+            INSERT INTO story_topic_state(topic, story_id, qc_status, dup_of_story_id)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                ("revolving_door_ca", "story-1", "ok", None),
+                ("patronage_ca", "story-1", "dup", "story-2"),
+            ],
+        )
+
+        verdicts = connection.execute(
+            "SELECT topic, qc_status, dup_of_story_id FROM story_topic_state "
+            "WHERE story_id = 'story-1' ORDER BY topic"
+        ).fetchall()
+        assert [tuple(row) for row in verdicts] == [
+            ("patronage_ca", "dup", "story-2"),
+            ("revolving_door_ca", "ok", None),
+        ]
+    finally:
+        connection.close()
+
+
+def test_two_topics_hold_independent_extractions_at_the_same_prompt_version(tmp_path):
+    connection = init_db(tmp_path / "pipeline.db")
+    try:
+        connection.execute("INSERT INTO stories(story_id, raw_json) VALUES ('story-1', '{}')")
+        connection.executemany(
+            """
+            INSERT INTO story_extractions(topic, story_id, prompt_version, relevant)
+            VALUES (?, 'story-1', 'v1', ?)
+            """,
+            [("revolving_door_ca", 1), ("patronage_ca", 0)],
+        )
+
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM story_extractions WHERE story_id = 'story-1'"
+            ).fetchone()[0]
+            == 2
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO story_extractions(topic, story_id, prompt_version, relevant)
+                VALUES ('revolving_door_ca', 'story-1', 'v1', 1)
+                """
+            )
+    finally:
+        connection.close()
+
+
+def test_invalid_model_output_is_persisted_without_cases(tmp_path):
+    """Schema-violating output is recorded, not dropped, and writes no cases row."""
+    connection = init_db(tmp_path / "pipeline.db")
+    try:
+        connection.execute("INSERT INTO stories(story_id, raw_json) VALUES ('story-1', '{}')")
+        connection.execute(
+            """
+            INSERT INTO story_extractions(
+                topic, story_id, prompt_version, relevant,
+                validation_status, validation_error, payload_json
+            )
+            VALUES ('revolving_door_ca', 'story-1', 'v1', 1, 'invalid',
+                    "expected_resolvable: unexpected value 'unknown'",
+                    '{"expected_resolvable": "unknown"}')
+            """
+        )
+        connection.commit()
+
+        row = connection.execute(
+            "SELECT validation_status, payload_json FROM story_extractions"
+        ).fetchone()
+        assert row[0] == "invalid"
+        assert json.loads(row[1]) == {"expected_resolvable": "unknown"}
+        assert connection.execute("SELECT COUNT(*) FROM cases").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_validation_status_rejects_unknown_values(tmp_path):
+    connection = init_db(tmp_path / "pipeline.db")
+    try:
+        connection.execute("INSERT INTO stories(story_id, raw_json) VALUES ('story-1', '{}')")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO story_extractions(topic, story_id, prompt_version, validation_status)
+                VALUES ('revolving_door_ca', 'story-1', 'v1', 'probably-fine')
+                """
+            )
+    finally:
+        connection.close()
+
+
+def test_connection_sets_busy_timeout(tmp_path):
+    connection = init_db(tmp_path / "pipeline.db")
+    try:
+        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == BUSY_TIMEOUT_MS
     finally:
         connection.close()
 
@@ -51,6 +181,34 @@ def test_init_db_migration_is_idempotent(tmp_path):
         assert second.execute("SELECT COUNT(*) FROM pipeline_runs").fetchone()[0] == 1
     finally:
         second.close()
+
+
+def test_migration_fails_on_schema_drift_without_advancing_version(tmp_path):
+    database_path = tmp_path / "pipeline.db"
+    connection = sqlite3.connect(database_path)
+    connection.execute("CREATE TABLE stories (story_id TEXT PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(DatabaseError, match="Failed to migrate") as error:
+        init_db(database_path)
+
+    assert isinstance(error.value.__cause__, sqlite3.OperationalError)
+    check = sqlite3.connect(database_path)
+    try:
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 0
+    finally:
+        check.close()
+
+
+def test_newer_database_version_raises_typed_error(tmp_path):
+    database_path = tmp_path / "pipeline.db"
+    connection = sqlite3.connect(database_path)
+    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    connection.close()
+
+    with pytest.raises(DatabaseError, match="newer than supported"):
+        init_db(database_path)
 
 
 def test_connection_enables_wal_and_foreign_keys(tmp_path):
@@ -109,8 +267,8 @@ def test_multiple_cases_can_belong_to_one_story(tmp_path):
         connection.execute("INSERT INTO stories(story_id, raw_json) VALUES ('story-1', '{}')")
         cursor = connection.execute(
             """
-            INSERT INTO story_extractions(story_id, prompt_version, relevant)
-            VALUES ('story-1', 'v1', 1)
+            INSERT INTO story_extractions(topic, story_id, prompt_version, relevant)
+            VALUES ('revolving_door_ca', 'story-1', 'v1', 1)
             """
         )
         extraction_id = cursor.lastrowid
@@ -161,8 +319,8 @@ def test_case_schema_supports_individual_and_cohort_gold_patterns(tmp_path):
         connection.execute("INSERT INTO stories(story_id, raw_json) VALUES ('story-1', '{}')")
         extraction_id = connection.execute(
             """
-            INSERT INTO story_extractions(story_id, prompt_version, relevant)
-            VALUES ('story-1', 'v1', 1)
+            INSERT INTO story_extractions(topic, story_id, prompt_version, relevant)
+            VALUES ('revolving_door_ca', 'story-1', 'v1', 1)
             """
         ).lastrowid
         connection.executemany(

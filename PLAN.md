@@ -2,8 +2,8 @@
 
 > **Agent quick start**
 >
-> - **Status:** foundation implemented (config, DB schema v1, CLI `init-db`, probe). Stages 1–5 pending.
-> - **Next action:** apply the **[Required corrections](#2-required-corrections-do-these-first)**, then implement `errors.py` + `ratelimit.py`, then Stage 1 (Search).
+> - **Status:** foundation implemented (config, DB schema v1, `identity`, `contracts`, CLI `init-db`, probe). Stages 1–5 pending.
+> - **Next action:** implement Stage 1 (Search).
 > - **Read before editing:** §0 (how to use this doc), §3 (invariants), §5 (data model), then the one stage section you are implementing.
 > - **Do not** run a full-range search, crawl, or LLM pass without explicit user approval.
 >
@@ -22,7 +22,7 @@
 |---|---|---|
 | 0 | [How to use this document](#0-how-to-use-this-document) | always, first |
 | 1 | [Objective and scope](#1-objective-and-scope) | onboarding |
-| 2 | [Required corrections](#2-required-corrections-do-these-first) | **now** |
+| 2 | [Corrections](#2-corrections) | before any schema change |
 | 3 | [Invariants](#3-invariants) | always |
 | 4 | [Verified baseline](#4-verified-baseline) | before any Media Cloud work |
 | 5 | [Data model](#5-data-model) | any DB change |
@@ -59,10 +59,12 @@ that satisfies the higher-priority source.
 |---|---|---|
 | uv, Python 3.12, lockfile | done | `pyproject.toml`, `uv.lock`, `.python-version` |
 | Secret-safe config loading | done | `src/mc_pipeline/config.py` |
-| SQLite schema v1 + `init-db` | done, **needs v2** | `src/mc_pipeline/db.py` |
+| SQLite schema v1 + `init-db` | done (C1–C3, C8 applied) | `src/mc_pipeline/db.py` |
+| Canonical hashing, fingerprints, case IDs | done (C4, C7) | `src/mc_pipeline/identity.py` |
+| Config → JSON Schema / model / CSV columns | done (C5, C6) | `src/mc_pipeline/contracts.py` |
 | Media Cloud probe | done | `scripts/probe_api.py` |
-| `errors.py` (typed taxonomy) | **missing** | §7.3 |
-| `ratelimit.py` | pending | §7.7 |
+| `errors.py` (typed taxonomy) | done (C9) | `src/mc_pipeline/errors.py` |
+| `ratelimit.py` | done | `src/mc_pipeline/ratelimit.py` |
 | Stage 1 Search | pending | §6.1 |
 | Stage 2 Dedup/QC | pending | §6.2 |
 | Stage 3 Fetch | pending | §6.3 |
@@ -86,128 +88,53 @@ design rules below exist only because two topics can return the same story.
 
 ---
 
-## 2. Required corrections (do these first)
+## 2. Corrections
 
-Design review found six defects in the current foundation. Fix them before building stages;
-each becomes much more expensive once data exists.
+Design review found twelve defects in the foundation. **C1–C12 are fixed** (2026-07-27).
+The migration waiver below was exercised and is now **expired**.
 
-### C1 — QC/dedup state is global but the decisions are per-topic  *(correctness, blocking)*
+### Resolved — C1–C8
 
-`stories` holds `qc_status`, `qc_reason`, `dup_of_story_id` on a globally-keyed row
-(`story_id TEXT PRIMARY KEY`). But every QC input is topic-scoped: `languages`,
-`domain_allowlist`, `exclude_url_patterns`, `min_title_chars`, the topic date range, and
-near-duplicate blocking within the topic's own result set.
+| # | Defect | Resolution | Landed in |
+|---|---|---|---|
+| C1 | QC/dedup verdicts stored on the globally-keyed `stories` row, so two topics returning one story overwrote each other | `qc_status`, `qc_reason`, `dup_of_story_id` moved to `story_topic_state(topic, story_id)`; `stories` is now immutable global metadata | `db.py`, `test_db.py` |
+| C2 | `UNIQUE(story_id, prompt_version)` omitted topic, colliding across topics at the same prompt version | `story_extractions.topic` added; constraint is `UNIQUE(topic, story_id, prompt_version)` | `db.py`, `test_db.py` |
+| C3 | `NOT NULL`/`CHECK` on model-supplied columns aborted the whole batch on one bad value | Pydantic validates before insert; `validation_status` (`valid`/`invalid`/`unparsed`) + `validation_error` record rejects with zero `cases` rows | `db.py`, `contracts.py`, `test_contracts.py` |
+| C4 | `cases.case_id` was `NOT NULL UNIQUE` with no generator | `identity.build_case_id()` — deterministic `topic:story_id:prompt_version:NN`, separator-checked, never model-supplied | `identity.py`, `test_identity.py` |
+| C5 | Config, `cases` columns, and the CSV header disagreed on six fields | `contracts.case_csv_columns()` composes prefix + config fields + suffix; `cohort_period`, `previous_sector`, `current_sector` added to config; `link_category` added to topic config | `contracts.py`, `topics.yaml`, `test_contracts.py` |
+| C6 | Mapping config `required` onto the JSON Schema `required` array breaks strict mode; `previous_org`/`current_org` were required but absent from cohort rows | `required` now controls nullability in the schema and enforcement in Pydantic; conditional rules declared as `discriminator` + `required_by_discriminator` | `contracts.py`, `config.py`, `topics.yaml` |
+| C7 | A fingerprint covering "request controls" would let a `page_size` tweak re-spend quota | `identity.window_fingerprint()` accepts semantic inputs and window bounds only — it has no request-control parameter, and a test asserts passing one is a `TypeError` | `identity.py`, `test_identity.py` |
+| C8 | No `busy_timeout`; WAL plus any concurrent reader raised `database is locked` immediately | `PRAGMA busy_timeout = 5000` in `connect_db` | `db.py`, `test_db.py` |
 
-*Failure:* topic A and topic B both return story S. A marks S `dup_of` a story B never
-retrieved; B marks S `off_domain`. Whichever `dedup` runs second silently overwrites the
-first. Violates **INV-4** and corrupts both exports.
+Two design points worth keeping in mind, both now enforced by tests:
 
-*Fix:* move the three columns into a topic-scoped table; keep `stories` as immutable global
-metadata. See §5.3.
+- **Conditional requirements are declarative.** `extraction.discriminator` names an enum field
+  and `extraction.required_by_discriminator` lists the fields each variant must supply. This is
+  what lets one strict schema serve both `individual` and `cohort` cases without the model being
+  forced to invent organizations for a cohort finding. It is generic — any topic can pick its
+  own discriminator.
+- **`articles` stays global**, keyed by `story_id`. Article text is topic-independent, so two
+  topics sharing a story share one fetch. Only *decisions* are topic-scoped. See §5.1.
 
-### C2 — `story_extractions` is not topic-scoped  *(correctness, blocking)*
-
-`UNIQUE(story_id, prompt_version)` omits topic, but prompt and schema are built from
-**topic** config. Two topics both at `prompt_version: v1` collide on a shared story — the
-second insert fails or overwrites a different topic's relevance decision. `extraction_batches`
-already carries `topic`; `story_extractions` must too (and must not rely on joining through
-`extraction_batch_id`, which is `ON DELETE SET NULL`).
-
-*Fix:* add `topic`, change the constraint to `UNIQUE(topic, story_id, prompt_version)`.
-
-### C3 — `NOT NULL`/`CHECK` on LLM-derived columns aborts batches  *(correctness)*
-
-`cases` declares `expected_resolvable NOT NULL CHECK (… IN ('yes','partial','no'))`,
-`status NOT NULL`, `claim NOT NULL`, `case_type CHECK (…)`. These values come from the model.
-A response with `expected_resolvable: "unknown"` raises `sqlite3.IntegrityError` mid-batch and
-aborts the transaction — the opposite of **INV-4**, which requires persisting invalid output
-as a recorded failure.
-
-*Fix:* keep the constraints (they are the right guard for the `cases` table) but **validate
-with Pydantic before insert**, and give `story_extractions` somewhere to record a rejection:
-add `validation_status` (`valid` | `invalid` | `unparsed`) and `validation_error`. Invalid
-payloads land in `story_extractions.payload_json` with `validation_status='invalid'` and
-produce **zero** `cases` rows.
-
-### C4 — `cases.case_id` has no generator  *(blocking Stage 4)*
-
-`case_id TEXT NOT NULL UNIQUE` is globally unique across topics, reruns, and prompt versions,
-but no config field defines it, the model is not asked for it, and `tests/test_db.py` supplies
-external gold IDs (`GC008`, `GC011`). Model-generated IDs would collide and be
-non-deterministic.
-
-*Fix:* derive deterministically, never from the model:
-
-```python
-case_id = f"{topic}:{story_id}:{prompt_version}:{ordinal:02d}"  # ordinal = index within the story's case list
-```
-
-Gold IDs such as `GC008` belong to the external evaluation set and map to `case_id` through a
-separate reconciliation file — they are never written by the pipeline.
-
-### C5 — Three-way field drift between config, schema, and CSV  *(correctness)*
-
-`cases` and the exported CSV promise `cohort_period`, `previous_sector`, `current_sector`,
-`source_outlet`, `source_url`, `link_category`, but `config/topics.yaml` never asks the model
-for them. "CSV column order is derived from configuration" and a hardcoded column list cannot
-both hold.
-
-*Fix:* one rule, enforced by a test (§6.5):
-
-```
-CSV columns = PROVENANCE_PREFIX (pipeline-derived, fixed)
-            + extraction fields in config order
-            + AUDIT_SUFFIX (fixed)
-```
-
-- **Pipeline-derived** (never asked of the model): `topic`, `case_id`, `story_id`, `url`,
-  `domain`, `publish_date`, `media_name`, `title`, `source_outlet` (= `media_name`),
-  `source_url` (= `url`), `link_category` (new topic-level config constant).
-- **Model-derived:** exactly the names in `extraction.fields`.
-- Add `cohort_period`, `previous_sector`, `current_sector` to `extraction.fields` (the gold set
-  uses them; `tests/test_db.py::test_case_schema_supports_individual_and_cohort_gold_patterns`
-  already writes `cohort_period`).
-- Add `link_category: "Revolving Door"` to the topic config.
-- Test asserts `{f.name for f in fields} ⊆ cases columns` and pins the exact CSV header.
-
-### C6 — `required: true` cannot mean JSON-Schema `required` under strict mode  *(implementation trap)*
-
-OpenAI strict structured outputs require **every** property to appear in the schema's
-`required` array; optionality is expressed as a nullable type union (`["string", "null"]`).
-Mapping config `required: true` onto the schema `required` array will make strict mode reject
-the schema. Separately, config marks `previous_org`/`current_org` required while cohort rows
-legitimately have neither (see the `GC011` fixture).
-
-*Fix:* config `required` controls **Pydantic validation**, not the JSON Schema `required`
-array. Schema generation emits all fields in `required` with nullable types; conditional rules
-(`case_type == 'individual'` ⇒ `person_name` present; `'cohort'` ⇒ `cohort_name` present) live
-in the Pydantic model. Document this in the docstring of `build_schema`.
-
-### Smaller items
+### Resolved — C9–C12
 
 | # | Item | Fix |
 |---|---|---|
-| C7 | Cache fingerprint including "request controls" would make a `page_size` change invalidate completed windows and re-spend quota | Fingerprint covers **semantic** inputs only: query, platform, collection IDs, source IDs, languages, window bounds, contract version. `page_size` is stored as row metadata, never keyed. |
-| C8 | `connect_db` has no `busy_timeout`; WAL + any concurrent reader raises `database is locked` immediately | `PRAGMA busy_timeout = 5000` in `connect_db` |
-| C9 | `init_db` raises bare `RuntimeError`; `ConfigError(RuntimeError)` is standalone. §7.3 promises a `PipelineError` root | Add `src/mc_pipeline/errors.py` now, before more modules copy the pattern; re-root `ConfigError`, raise `DatabaseError` |
-| C10 | `CREATE TABLE IF NOT EXISTS` inside a versioned migration silently no-ops on drift while still advancing `user_version` | Plain `CREATE TABLE` in migrations; `IF NOT EXISTS` only for indexes |
-| C11 | `_load_required_env` re-parses `.env` on every call (twice for LLM credentials) | Parse once per call site, or cache per path |
-| C12 | `cli.main()` is dead code (entry point targets `cli:app`) | Point the entry to `cli:main`, or delete `main()` |
+| C9 | `init_db` raised bare `RuntimeError`; `ConfigError(RuntimeError)` was standalone | Added `errors.py`, re-rooted `ConfigError`, and raise `DatabaseError` for migration failures |
+| C10 | `CREATE TABLE IF NOT EXISTS` inside a versioned migration could hide drift | Migrations use plain `CREATE TABLE`; only indexes retain `IF NOT EXISTS` |
+| C11 | `_load_required_env` re-parsed `.env` for each required LLM value | Each credential loader parses its env file once |
+| C12 | `cli.main()` was dead code because the entry point targeted `cli:app` | Entry point now targets `cli:main` |
 
-### Migration policy for these fixes
+### Migration waiver — expired
 
-**R-DB-1** normally forbids editing a released migration. It is waived **once**, here, on the
-condition that no durable data exists. Check first:
+**R-DB-1** normally forbids editing a released migration. It was waived once for C1–C3, after
+confirming no `data/mc.db` existed; `_migration_1` was amended in place and `SCHEMA_VERSION`
+stays `1`. **That waiver is now spent.** All further schema changes are additive: add
+`_migration_2` and bump `SCHEMA_VERSION`.
 
-```bash
-$UV run python -c "import sqlite3,sys; c=sqlite3.connect('data/mc.db'); \
-print(c.execute('SELECT COUNT(*) FROM search_windows').fetchone()[0])" 2>/dev/null || echo "no db"
-```
+Anyone holding a database created before 2026-07-27 must delete and re-run `init-db`; it
+predates the C1–C3 columns and no upgrade path exists.
 
-- `no db` or `0` → amend `_migration_1` in place, keep `SCHEMA_VERSION = 1`, delete `data/mc.db`.
-- Any rows → do **not** amend. Add `_migration_2`, bump `SCHEMA_VERSION = 2`.
-
-After the first real search run, the waiver expires permanently: additive migrations only.
 
 ---
 
@@ -294,11 +221,12 @@ Anything computed from `TopicConfig` is topic-scoped. This is the rule C1 and C2
 Patronage-only fields from `gold_cases.csv` (party, donation values) are outside this topic's
 output contract.
 
-### 5.3 Schema deltas required by §2
+### 5.3 Topic-scoping in the live schema (C1–C3, applied)
+
+`src/mc_pipeline/db.py` is authoritative; this is the shape to preserve.
 
 ```sql
--- C1: stories loses topic-dependent decisions
---     DROP qc_status, qc_reason, dup_of_story_id FROM stories
+-- C1: verdicts that depend on topic config live outside the global stories row
 CREATE TABLE story_topic_state (
     topic           TEXT NOT NULL,
     story_id        TEXT NOT NULL REFERENCES stories(story_id) ON DELETE CASCADE,
@@ -308,23 +236,23 @@ CREATE TABLE story_topic_state (
     decided_at      TEXT,
     PRIMARY KEY (topic, story_id)
 );
-CREATE INDEX IF NOT EXISTS ix_story_topic_state_qc ON story_topic_state(topic, qc_status);
 
--- C2 + C3: story_extractions becomes topic-scoped and records validation outcome
-ALTER TABLE story_extractions ADD COLUMN topic             TEXT NOT NULL DEFAULT '';
-ALTER TABLE story_extractions ADD COLUMN validation_status TEXT;   -- valid|invalid|unparsed
-ALTER TABLE story_extractions ADD COLUMN validation_error  TEXT;
--- replace UNIQUE(story_id, prompt_version) with:
-CREATE UNIQUE INDEX ux_story_extractions_topic
-    ON story_extractions(topic, story_id, prompt_version);
+-- C2 + C3: topic-scoped extractions that can record a rejected payload
+CREATE TABLE story_extractions (
+    ...
+    topic             TEXT NOT NULL,
+    validation_status TEXT CHECK (validation_status IN ('valid', 'invalid', 'unparsed')),
+    validation_error  TEXT,
+    UNIQUE(topic, story_id, prompt_version)
+);
 ```
 
-If amending `_migration_1` under the §2 waiver, write these inline instead of as `ALTER`s and
-make `topic` a plain `NOT NULL` column with no default.
+Any new table storing a decision derived from `TopicConfig` must be keyed by topic too.
 
 ### 5.4 Transaction protocol
 
-- **R-DB-1** Never edit a released migration once any database may hold data (waived once, §2).
+- **R-DB-1** Never edit a released migration once any database may hold data. The one-time
+  waiver for C1–C3 is **spent** (§2); all further changes are additive.
 - **R-DB-2** One migration version = forward-only, deterministic schema changes.
 - **R-DB-3** Apply migrations before stage work.
 - **R-DB-4** One transaction per search page, fetch result, extraction batch, or export snapshot.
@@ -371,6 +299,8 @@ public interface.
 |---|---|---|
 | `config.py` | YAML models, env-name resolution, stage credentials | API calls, DB writes |
 | `errors.py` | `PipelineError` hierarchy | anything else |
+| `identity.py` | canonical JSON, SHA-256 hashes, window fingerprints, case IDs | config parsing, I/O |
+| `contracts.py` | config → JSON Schema, validation model, CSV columns | provider calls, DB writes |
 | `db.py` | connections, migrations, transactions, repositories | stage orchestration |
 | `ratelimit.py` | clocks, token bucket, per-domain delay, `Retry-After` parsing | HTTP clients |
 | `search.py` | **all** `mediacloud` imports/calls, windowing, cache writes | article HTTP |
@@ -409,8 +339,9 @@ def search_topic(
 - **S1-R3** Split the range into closed, non-overlapping windows of `window_days`.
 - **S1-R4** `estimate` calls `story_count` only, never `story_list`.
 - **S1-R5** Skip windows whose fingerprint is already complete (**INV-1**).
-- **S1-R6** Fingerprint = canonical JSON of query, platform, collection IDs, source IDs,
-  languages, window bounds, contract version. **Never** `page_size` or other request controls (C7).
+- **S1-R6** Use `identity.window_fingerprint()`. It covers query, platform, collection IDs,
+  source IDs, languages, window bounds, and contract version — and deliberately has no
+  request-control parameter, so `page_size` cannot invalidate a completed window (C7).
 - **S1-R7** Pass `datetime.date` at the client boundary; `expanded=False` — do not retry the
   known 403.
 - **S1-R8** Persist each page before requesting the next; mark the window complete only after
@@ -443,7 +374,8 @@ def deduplicate_topic(
 
 Pure function of the database — no network, no credentials, free to rerun after tuning rules.
 
-- **S2-R1** Write decisions to `story_topic_state`, never to `stories` (C1).
+- **S2-R1** Write decisions to `story_topic_state`, keyed by `(topic, story_id)`, never to
+  `stories` (C1). Two topics must be able to disagree about the same story.
 - **S2-R2** Normalize URLs: drop scheme and `www.`, tracking params (`utm_*`, `fbclid`),
   fragments, trailing slash.
 - **S2-R3** Normalize titles: case-fold, collapse punctuation and whitespace, strip outlet
@@ -528,8 +460,9 @@ def extract_topic(
 `story_extractions`, `cases`
 
 - **S4-R1** Operate only on stored text with terminal fetch status `ok`. Never fetch a URL here.
-- **S4-R2** Build prompt and JSON Schema deterministically from topic config; hash the exact
-  system prompt, user-template version, and schema.
+- **S4-R2** Build the schema with `contracts.build_response_json_schema()` and the prompt
+  deterministically from topic config; hash the exact system prompt, user-template version,
+  and schema.
 - **S4-R3** Client with `max_retries=0` — pipeline pacing and retry are authoritative.
 - **S4-R4** Serial requests, ≤ 30 per minute, via the shared token bucket.
 - **S4-R5** Pack `articles_per_request` (default 5) labelled articles; delimit each with an
@@ -538,11 +471,12 @@ def extract_topic(
 - **S4-R7** Try strict JSON Schema; on an **explicit unsupported-format** response fall back to
   JSON-object mode with the schema inlined, and record the downgrade once. Do not downgrade on
   unrelated 400s.
-- **S4-R8** Validate locally with Pydantic even when the provider claims strict conformance.
-- **S4-R9** Config `required` drives **Pydantic**, not the schema `required` array; emit all
-  properties as required with nullable types (C6). Conditional rules by `case_type` live in the
-  Pydantic model.
-- **S4-R10** Generate `case_id` deterministically (C4); never from the model.
+- **S4-R8** Validate every response with `contracts.build_response_model()` even when the
+  provider claims strict conformance.
+- **S4-R9** Config `required` drives **Pydantic**, not the schema `required` array (C6).
+  Conditional rules come from `extraction.discriminator` and
+  `extraction.required_by_discriminator` — never hardcode `case_type` semantics in Python.
+- **S4-R10** Generate `case_id` with `identity.build_case_id()` (C4); never from the model.
 - **S4-R11** Invalid or unparsable output ⇒ `story_extractions.validation_status` set,
   payload retained, **zero** `cases` rows. Never let an `IntegrityError` abort a batch (C3).
 - **S4-R12** Normalize whitespace for evidence matching only; store the original quote.
@@ -577,7 +511,8 @@ Two UTF-8 RFC-4180 CSVs:
 - `<topic>.csv` — one row per case
 - `<topic>_articles.csv` — one row per story, showing dedup/QC/fetch/relevance coverage
 
-**Column rule (C5):** `PROVENANCE_PREFIX` + extraction fields in config order + `AUDIT_SUFFIX`.
+**Column rule (C5, implemented):** call `contracts.case_csv_columns(topic)` — the prefix,
+config fields in order, and suffix are composed there and nowhere else.
 
 ```text
 # PROVENANCE_PREFIX (pipeline-derived)
@@ -588,22 +523,22 @@ source_outlet,source_url,link_category,
 evidence_verified,model,prompt_version,extracted_at
 ```
 
-Article-audit CSV:
+`source_outlet` = `media_name`, `source_url` = `url`, `link_category` = the topic constant.
+Article-audit CSV columns come from `contracts.ARTICLE_AUDIT_COLUMNS`:
 
 ```text
 topic,story_id,url,domain,publish_date,media_name,title,qc_status,qc_reason,
 dup_of_story_id,fetch_status,source,text_chars,relevant,reject_reason
 ```
 
-- **S5-R1** One header row, deterministic column order, derived by the rule above — never a
-  second hardcoded list.
+- **S5-R1** One header row; take the column order from `contracts` — never write a second list.
 - **S5-R2** Empty string for nullable values; never literal `None` or `null`.
 - **S5-R3** Preserve claims and evidence with correct CSV quoting.
 - **S5-R4** Write to a temp file and atomically replace.
 - **S5-R5** Sort by `publish_date`, `story_id`, `case_id`.
 - **S5-R6** Reconcile row counts before replacement; a mismatch is exit code 7.
-- **S5-R7** A test pins the exact header and asserts
-  `{f.name for f in extraction.fields} ⊆ cases columns`. Changing CSV columns silently is prohibited.
+- **S5-R7** `tests/test_contracts.py` already guards config↔`cases`↔CSV agreement and rejects
+  a field name that collides with a reserved column. Changing CSV columns silently is prohibited.
 
 **Reconciliation identity:** `hits = duplicates + qc_rejects + fetched_ok + fetch_failed + too_short`.
 

@@ -1,6 +1,6 @@
 # Secrets
 .env
-config/.env
+*/.env
 
 # Python and uv
 .venv/
@@ -27,4 +27,3 @@ data/
 .DS_Store
 .idea/
 .vscode/
-

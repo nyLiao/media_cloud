@@ -5,6 +5,7 @@ media_cloud:
   # mediacloud 5.1.0 supports page_size; the server-side maximum is not yet documented.
   page_size: 1000
   max_pages_per_window: 50
+  timeout_s: 300
 
 fetch:
   user_agent: "media-cloud-research/0.1 (+mailto:you@example.org)"
@@ -21,6 +22,7 @@ llm:
   base_url_env: LLM_BASE_URL
   api_key_env: LLM_API_KEY
   model: ""
+  timeout_s: 300
   max_requests_per_min: 30
   articles_per_request: 5
   max_article_chars: 12000
@@ -32,6 +34,8 @@ llm:
 topics:
   revolving_door_ca:
     label: "Revolving Door (Canada)"
+    # Written to cases.link_category and the CSV; not asked of the model.
+    link_category: "Revolving Door"
     query: >-
       "revolving door" OR
       ((lobbyist* OR "lobbying firm*" OR lobby) AND
@@ -54,6 +58,12 @@ topics:
         government/public-sector role and a private-sector/lobbying role (in either
         direction). General commentary about revolving doors with no named person
         is NOT relevant.
+      # `required` below means "never null". Requirements that hold for only some
+      # case types belong here, because a strict JSON Schema cannot express them.
+      discriminator: case_type
+      required_by_discriminator:
+        individual: [person_name, previous_org, current_org]
+        cohort: [cohort_name]
       fields:
         - name: case_type
           type: enum
@@ -72,26 +82,38 @@ topics:
           type: integer
           required: false
           description: "Number of people in the cohort when explicitly reported."
+        - name: cohort_period
+          type: string
+          required: false
+          description: "Period the cohort finding covers, such as 2019-2023."
         - name: previous_org
           type: string
-          required: true
-          description: "Organization they left."
+          required: false
+          description: "Organization they left; null for cohort findings without one."
         - name: previous_role
           type: string
           required: false
           description: "Job title at the previous organization."
+        - name: previous_sector
+          type: string
+          required: false
+          description: "Sector of the previous organization, such as public or private."
         - name: previous_year
           type: integer
           required: false
           description: "Year they left, 4-digit. null if not stated."
         - name: current_org
           type: string
-          required: true
-          description: "Organization they joined."
+          required: false
+          description: "Organization they joined; null for cohort findings without one."
         - name: current_role
           type: string
           required: false
           description: "Job title at the new organization."
+        - name: current_sector
+          type: string
+          required: false
+          description: "Sector of the current organization, such as public or private."
         - name: current_year
           type: integer
           required: false
