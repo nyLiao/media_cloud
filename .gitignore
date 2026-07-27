@@ -1,0 +1,30 @@
+# Secrets
+.env
+config/.env
+
+# Python and uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Builds and coverage
+build/
+dist/
+.coverage
+htmlcov/
+
+# Pipeline outputs
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+

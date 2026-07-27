@@ -1,0 +1,124 @@
+media_cloud:
+  api_key_env: MC_API_TOKEN
+  platform: onlinenews-mediacloud
+  window_days: 30
+  # mediacloud 5.1.0 supports page_size; the server-side maximum is not yet documented.
+  page_size: 1000
+  max_pages_per_window: 50
+
+fetch:
+  user_agent: "media-cloud-research/0.1 (+mailto:you@example.org)"
+  per_domain_delay_s: 3.0
+  global_max_rps: 2.0
+  timeout_s: 30
+  max_retries: 4
+  respect_robots: true
+  wayback_fallback: true
+  min_text_chars: 500
+  save_raw_html: true
+
+llm:
+  base_url_env: LLM_BASE_URL
+  api_key_env: LLM_API_KEY
+  model: ""
+  max_requests_per_min: 30
+  articles_per_request: 5
+  max_article_chars: 12000
+  max_output_tokens: 4000
+  temperature: 0
+  structured_output: json_schema
+  prompt_version: v1
+
+topics:
+  revolving_door_ca:
+    label: "Revolving Door (Canada)"
+    query: >-
+      "revolving door" OR
+      ((lobbyist* OR "lobbying firm*" OR lobby) AND
+      ("public sector" OR "civil serv*" OR "public office" OR
+      "former minister*" OR "former official*" OR parliament*))
+    start_date: 2021-01-01
+    end_date: 2025-12-31
+    collection_ids: [34411583]
+    languages: [en]
+    # An empty allowlist disables an additional domain filter. The collection scopes sources.
+    domain_allowlist: []
+    qc:
+      min_title_chars: 20
+      exclude_url_patterns: ["/video/", "/live/", "/sports/", "/photo", "/tag/"]
+      near_dup_threshold: 92
+    extraction:
+      unit: person_transition
+      relevance_criteria: >-
+        The article must describe a specific named individual moving between a
+        government/public-sector role and a private-sector/lobbying role (in either
+        direction). General commentary about revolving doors with no named person
+        is NOT relevant.
+      fields:
+        - name: case_type
+          type: enum
+          required: true
+          values: [individual, cohort]
+          description: "Whether this finding concerns a named person or a group-level pattern."
+        - name: person_name
+          type: string
+          required: false
+          description: "Full name of the individual; null for cohort findings."
+        - name: cohort_name
+          type: string
+          required: false
+          description: "Short descriptive name for a cohort finding."
+        - name: cohort_size
+          type: integer
+          required: false
+          description: "Number of people in the cohort when explicitly reported."
+        - name: previous_org
+          type: string
+          required: true
+          description: "Organization they left."
+        - name: previous_role
+          type: string
+          required: false
+          description: "Job title at the previous organization."
+        - name: previous_year
+          type: integer
+          required: false
+          description: "Year they left, 4-digit. null if not stated."
+        - name: current_org
+          type: string
+          required: true
+          description: "Organization they joined."
+        - name: current_role
+          type: string
+          required: false
+          description: "Job title at the new organization."
+        - name: current_year
+          type: integer
+          required: false
+          description: "Year they joined, 4-digit. null if not stated."
+        - name: direction
+          type: enum
+          required: false
+          values: [public_to_private, private_to_public, unclear]
+          description: "Direction of the move."
+        - name: jurisdiction
+          type: string
+          required: false
+          description: "Relevant Canadian jurisdiction, such as federal or British Columbia."
+        - name: expected_resolvable
+          type: enum
+          required: true
+          values: ["yes", partial, "no"]
+          description: "Whether the article contains enough detail to resolve the transition."
+        - name: status
+          type: string
+          required: true
+          description: "Reported status of the case, such as reported or under review."
+        - name: claim
+          type: string
+          required: true
+          description: "Concise human-readable summary of the revolving-door finding."
+        - name: evidence_quote
+          type: string
+          required: true
+          description: "Verbatim sentence from the article supporting this row. Must appear in the text."
