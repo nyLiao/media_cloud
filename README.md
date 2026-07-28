@@ -46,10 +46,29 @@ All three commands accept `--config` and `--db`; `estimate` and `search` also ac
 `data/review/<topic>-search.csv` by default; use `--output` to choose another CSV path. See
 `docs/search-review.md` for the review workflow and exit-code handling.
 
-Media Cloud standard results contain metadata only for this account. The interrupted run stored
-5,564 stories with zero Media Cloud text values. Stage 3 therefore uses one direct article-page
-request when implemented and skips blocked, missing, or short pages; Wayback and retries are off
-by default.
+## Stage 2: Deduplicate and QC
+
+Stage 2 is an offline, deterministic database pass. It applies the topic's language, date,
+URL, title-length, and optional domain rules before removing normalized URL and exact-title
+duplicates. It never calls Media Cloud, fetches article pages, or loads credentials.
+
+Run it explicitly after reviewing the Stage 1 metadata:
+
+```bash
+scripts/run_dedup_qc.sh --topic revolving_door_ca
+```
+
+The script writes a timestamped log under `data/logs/`. The underlying command accepts
+`--config` and `--db`, and can be rerun safely after changing QC configuration:
+
+```bash
+uv run mc-pipeline dedup --topic revolving_door_ca --db data/mc.db
+```
+
+Media Cloud standard results contain metadata only for this account. The completed full-study
+search stored 7,351 distinct stories in eight pages with zero Media Cloud text values. Stage 3
+therefore uses one direct article-page request when implemented and skips blocked, missing, or
+short pages; Wayback and retries are off by default.
 
 The LLM extraction contract is intentionally limited to `person_name`, `cohort_name`,
 `private_org`, `private_time`, `public_org`, `public_time`, and `jurisdiction`. Preview the exact
@@ -76,9 +95,9 @@ part of the gate.
 
 The current implementation establishes repository configuration, the versioned SQLite schema,
 deterministic hashing and identifiers (`identity.py`), the config-derived extraction contract
-(`contracts.py`), and resumable Stage 1 Media Cloud search with a metadata review export.
-Article acquisition, LLM extraction, and final case CSV export are implemented in later stages
-described in `PLAN.md`.
+(`contracts.py`), resumable Stage 1 Media Cloud search with a metadata review export, and
+topic-scoped Stage 2 deduplication/QC. Article acquisition, LLM extraction, and final case CSV
+export are implemented in later stages described in `PLAN.md`.
 
 `config/topics.yaml` drives behaviour: `extraction.fields` alone determines the JSON Schema
 sent to the model, the validation model, and the exported CSV columns, so adding a field is a

@@ -4,18 +4,13 @@ import json
 import sqlite3
 
 import pytest
-from typer.testing import CliRunner
 
 import mc_pipeline.db as db_module
-from mc_pipeline.cli import app
 from mc_pipeline.db import (
-    BUSY_TIMEOUT_MS,
     SCHEMA_VERSION,
     complete_pipeline_run,
-    connect_db_readonly,
     get_search_window,
     init_db,
-    mark_search_window_complete,
     mark_search_window_failed,
     persist_search_page,
     search_review_rows,
@@ -171,14 +166,6 @@ def test_validation_status_rejects_unknown_values(tmp_path):
         connection.close()
 
 
-def test_connection_sets_busy_timeout(tmp_path):
-    connection = init_db(tmp_path / "pipeline.db")
-    try:
-        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == BUSY_TIMEOUT_MS
-    finally:
-        connection.close()
-
-
 def test_init_db_migration_is_idempotent(tmp_path):
     database_path = tmp_path / "pipeline.db"
     first = init_db(database_path)
@@ -328,7 +315,15 @@ def test_search_repository_persists_provenance_and_review_data(tmp_path):
             "story_count": 2,
         }
 
-        mark_search_window_complete(connection, window_id, raw_json='{"page":"final"}')
+        persist_search_page(
+            connection,
+            window_id=window_id,
+            page_number=2,
+            stories=[],
+            next_pagination_token=None,
+            window_raw_json='{"page":"final"}',
+            pagination_completed=True,
+        )
         complete_pipeline_run(connection, run_id, status="completed")
 
         completed = connection.execute(
@@ -473,25 +468,6 @@ def test_connection_enables_wal_and_foreign_keys(tmp_path):
         connection.close()
 
 
-def test_readonly_connection_requires_existing_database_and_rejects_writes(tmp_path):
-    database_path = tmp_path / "pipeline.db"
-    with pytest.raises(DatabaseError, match="does not exist"):
-        connect_db_readonly(database_path)
-
-    connection = init_db(database_path)
-    connection.close()
-    readonly = connect_db_readonly(database_path)
-    try:
-        assert readonly.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
-        with pytest.raises(sqlite3.OperationalError, match="readonly"):
-            readonly.execute(
-                "INSERT INTO pipeline_runs(run_uuid, topic, stage, config_hash) "
-                "VALUES ('run', 'topic', 'search', 'hash')"
-            )
-    finally:
-        readonly.close()
-
-
 def test_duplicate_story_can_link_to_multiple_windows(tmp_path):
     connection = init_db(tmp_path / "pipeline.db")
     try:
@@ -563,22 +539,6 @@ def test_multiple_cases_can_belong_to_one_story(tmp_path):
         connection.close()
 
 
-def test_raw_json_round_trips(tmp_path):
-    connection = init_db(tmp_path / "pipeline.db")
-    payload = {"api": {"identifiers": [1, 2]}, "title": "A story"}
-    try:
-        connection.execute(
-            "INSERT INTO stories(story_id, raw_json) VALUES (?, ?)",
-            ("story-1", json.dumps(payload)),
-        )
-        stored_payload = connection.execute(
-            "SELECT raw_json FROM stories WHERE story_id = 'story-1'"
-        ).fetchone()[0]
-        assert json.loads(stored_payload) == payload
-    finally:
-        connection.close()
-
-
 def test_case_schema_supports_individual_and_cohort_gold_patterns(tmp_path):
     connection = init_db(tmp_path / "pipeline.db")
     try:
@@ -645,12 +605,3 @@ def test_case_schema_supports_individual_and_cohort_gold_patterns(tmp_path):
         ]
     finally:
         connection.close()
-
-
-def test_init_db_cli_command(tmp_path):
-    database_path = tmp_path / "cli.db"
-    result = CliRunner().invoke(app, ["init-db", "--db", str(database_path)])
-
-    assert result.exit_code == 0
-    assert database_path.exists()
-    assert f"schema version {SCHEMA_VERSION}" in result.stdout

@@ -2,8 +2,8 @@
 
 > **Agent quick start**
 >
-> - **Status:** foundation and Stage 1 Search implemented. Stages 2–5 pending.
-> - **Next action:** review the Stage 1 CSV, then implement Stage 2 Dedup/QC.
+> - **Status:** foundation, Stage 1 Search, and Stage 2 Dedup/QC implemented. Stages 3–5 pending.
+> - **Next action:** review the Stage 1 CSV, then run `scripts/run_dedup_qc.sh` explicitly.
 > - **Read before editing:** §0 (how to use this doc), §3 (invariants), §5 (data model), then the one stage section you are implementing.
 > - **Do not** run a full-range search, crawl, or LLM pass without explicit user approval.
 >
@@ -66,7 +66,7 @@ that satisfies the higher-priority source.
 | `errors.py` (typed taxonomy) | done (C9) | `src/mc_pipeline/errors.py` |
 | `ratelimit.py` | done | `src/mc_pipeline/ratelimit.py` |
 | Stage 1 Search | done | `src/mc_pipeline/search.py`, §6.1 |
-| Stage 2 Dedup/QC | pending | §6.2 |
+| Stage 2 Dedup/QC | done | `src/mc_pipeline/dedup.py`, §6.2 |
 | Stage 3 Fetch | pending | §6.3 |
 | Stage 4 Extract | pending | §6.4 |
 | Stage 5 Export | pending | §6.5 |
@@ -171,9 +171,16 @@ source URLs: `docs/api-notes.md`.
 - The `Story` TypedDict permits optional `text`, but `expanded=True` returns **HTTP 403** for
   this account. Full-text acquisition (Stage 3) is therefore required, and Stage 3 must still
   honour `mc_text` if a future response supplies it.
-- The interrupted 2021–2025 run stored 5,564 stories and **zero** `mc_text` values. A bounded
-  eight-URL check returned six HTTP 200 responses, one 403, and one 404, so direct page fetching
-  is applicable for many records but must skip blocked or missing pages without retry loops.
+- The completed full-study search returned **7,351 distinct stories in eight result pages**, equal
+  to the sum of the earlier per-window estimates, and still stored **zero** `mc_text` values. The
+  database contains 96 domains; the ten largest account for 3,965 stories, so per-domain pacing
+  materially affects Stage 3 runtime.
+- The stored metadata shows 797 exact case-folded title groups containing 2,173 excess syndicated
+  copies, 792 `/sports/` URLs, 96 URLs with query strings, 12 titles shorter than 20 characters,
+  and three non-English provider results. These are deterministic Stage 2 signals; they justify
+  exact deduplication and configured QC before any crawler or LLM request.
+- A bounded eight-URL check returned six HTTP 200 responses, one 403, and one 404, so direct page
+  fetching is applicable for many records but must skip blocked or missing pages without retries.
 - Search is not title-only: live results matched without query terms in their titles.
 - `LLM_BASE_URL` already ends in `/v1` and must be passed unchanged.
 
@@ -352,11 +359,16 @@ def search_topic(
 - **S1-R7** Pass `datetime.date` at the client boundary; `expanded=False` — do not retry the
   known 403.
 - **S1-R8** Persist each page before requesting the next; mark the window complete only after
-  the token is exhausted. Never mark complete after a partial page failure.
-- **S1-R9** On reaching `max_pages_per_window`, persist the partition incomplete and stop it.
+  the token is exhausted. Persist the final page and completed state in the same transaction so a
+  crash cannot replay page one and spend quota again. Persist malformed provider rows as page-level
+  record errors while retaining valid rows from the same response.
+- **S1-R9** On reaching `max_pages_per_window`, persist the partition incomplete and stop it;
+  raising the limit on a later rerun resumes from the stored token.
 - **S1-R10** Make one provider attempt per count or page. On any failure, persist the partition
-  as failed, skip it, and continue; the operator decides whether a later rerun is worth quota.
+  as failed, skip it, and continue; failed windows remain resumable when the operator reruns.
 - **S1-R11** Pagination tokens are opaque transient progress — never a cache key.
+- **S1-R12** Resume only when both an opaque token and the original page size are stored. Treat
+  legacy or inconsistent progress as terminal failure and make no provider request.
 
 **Done when:** missing scope fails before any API call · the eight-key payload round-trips
 through `raw_json` · one story can belong to multiple windows · a completed window produces
@@ -380,20 +392,28 @@ def deduplicate_topic(
 
 Pure function of the database — no network, no credentials, free to rerun after tuning rules.
 
-- **S2-R1** Write decisions to `story_topic_state`, keyed by `(topic, story_id)`, never to
-  `stories` (C1). Two topics must be able to disagree about the same story.
+- **S2-R1** Write topic-dependent decisions to `story_topic_state`, keyed by `(topic, story_id)`,
+  never to `stories` (C1). Persist topic-independent `url_norm` and `title_norm` on `stories` so
+  their indexes and downstream consumers see the computed values. Two topics must be able to
+  disagree about the same story's QC verdict.
 - **S2-R2** Normalize URLs: drop scheme and `www.`, tracking params (`utm_*`, `fbclid`),
   fragments, trailing slash.
 - **S2-R3** Normalize titles: case-fold, collapse punctuation and whitespace, strip outlet
   suffixes (`" | CBC News"`, `" - The Globe and Mail"`, `" — National Post"`).
-- **S2-R4** Order: URL duplicates → exact-title duplicates → optional near-duplicates within a
-  small publication-date block (`rapidfuzz.token_set_ratio ≥ near_dup_threshold`, blocked by
-  `publish_date ± 3 days` to stay O(n·k)).
-- **S2-R5** Canonical row for a title-duplicate group is the **earliest** `publish_date`.
-- **S2-R6** Apply language, date-range, URL-pattern, title-length, and optional domain rules.
-  An empty `domain_allowlist` means no extra domain filter — the collection already scopes sources.
+- **S2-R4** Apply language, date-range, URL-pattern, title-length, and optional domain rules before
+  duplicate grouping. Rejected rows are not canonical candidates. An empty `domain_allowlist`
+  means no extra domain filter — the collection already scopes sources.
+- **S2-R5** Deduplication order among QC-passing rows is URL duplicates → exact-title duplicates.
+  Do not enable fuzzy near-duplicate removal by default: an uncertain match must be retained rather
+  than silently discard a possible case. Add it only if manually reviewed fixtures establish a
+  high-confidence rule.
+- **S2-R6** Canonical rows use the earliest `publish_date`, then lexical `story_id` to break ties;
+  a missing date sorts last instead of raising.
 - **S2-R7** Only deterministic, high-confidence `qc_status='ok'` rows proceed. Rejected metadata
   may remain in the cache for quota safety but is excluded from all downstream work.
+- **S2-R8** The current corpus demonstrates the expected payoff: exact-title groups alone can
+  remove up to 2,173 redundant downstream fetches, while configured `/sports/`, language, and
+  short-title rules reject obvious failures without another external query.
 
 **Done when:** deterministic on fixtures · idempotent on rerun · two topics can hold different
 `qc_status` for the same story (the C1 regression test).
@@ -436,6 +456,13 @@ Order of acquisition:
 - **S3-R8** Re-extraction from stored HTML must make **no** network calls.
 - **S3-R9** Do not use Wayback or paywall bypasses in the default pipeline.
 - **S3-R10** `too_short` stays distinct from transport `fetch_failed`.
+- **S3-R11** The current Media Cloud cache has no usable full text, so production Stage 3 is a
+  direct-page crawler, not an MC text reader. Process deterministic high-signal title matches
+  first and leave lower-signal rows pending; do not reject them solely because search can match
+  terms outside the title.
+- **S3-R12** Start with a user-selected `--limit` batch and inspect fetch yield before expanding.
+  With 96 domains and observed 403/404 outcomes, bounded batches minimize failed requests and make
+  outlet-specific problems visible before a long run.
 
 **Done when:** mocked success and single-attempt failure paths are covered · one domain's delay
 is observably respected under a fake clock · failed rows remain skipped unless the user starts
@@ -486,6 +513,12 @@ def extract_topic(
 - **S4-R14** Record provider request IDs and usage; never headers or secrets.
 - **S4-R15** Unknown proxy model names fall back to `tiktoken.get_encoding("o200k_base")` for
   token estimates.
+- **S4-R16** Run extraction only after Stage 2 and successful Stage 3 text acquisition. The search
+  corpus is broad—only 366 titles contain `lobby` or `revolving door`—so title absence is not an
+  LLM rejection rule, but high-signal fetched articles should be analyzed first.
+- **S4-R17** Use small user-launched batches and inspect accepted-case yield before expanding.
+  Packing five labelled articles per request is the default quota-saving unit; failed, invalid,
+  ambiguous, or low-confidence batches are terminal and never requeued automatically.
 
 **Done when:** one high-confidence individual and one high-confidence cohort validate with only
 the seven configured fields · ambiguous articles yield no case rows · one provider failure does
@@ -539,7 +572,7 @@ dup_of_story_id,fetch_status,source,text_chars,relevant,reject_reason
 - **S5-R7** `tests/test_contracts.py` already guards config↔`cases`↔CSV agreement and rejects
   a field name that collides with a reserved column. Changing CSV columns silently is prohibited.
 
-**Reconciliation identity:** `hits = duplicates + qc_rejects + fetched_ok + fetch_failed + too_short`.
+**Reconciliation identity:** `distinct_reachable_stories = duplicates + qc_rejects + fetched_ok + fetch_failed + too_short`.
 
 ---
 
@@ -646,16 +679,22 @@ Layers: **unit** (no network, temp dirs, fake clock) → **adapter** (mocked Med
 LLM with recorded redacted fixtures) → **integration** (bounded live, only when requested) →
 **manual accuracy** (human review).
 
-- **R-TEST-1** Every change adds or updates the narrowest relevant tests, in the same change.
+- **R-TEST-1** Add or update tests only for core implementation: algorithms and invariants,
+  migrations and transactional correctness, quota/cache/resume behaviour, schema validation and
+  parsing, rate limiting, and external-service adapters.
 - **R-TEST-2** No real network in unit tests; no real sleeping.
 - **R-TEST-3** No dependence on row order unless the query orders explicitly.
 - **R-TEST-4** Fixtures exclude full copyrighted article bodies — author test text or store a
   short compliant excerpt.
 - **R-TEST-5** Database tests use temp paths and close connections.
-- **R-TEST-6** CLI tests assert exit code, bounded output, and absence of secret values.
+- **R-TEST-6** Do not create dedicated tests for minor plumbing: static config values, trivial
+  file or environment I/O, documentation, prompt wording snapshots, simple CLI forwarding,
+  pass-through helpers, or exception inheritance.
 - **R-TEST-7** Tests never read the real `config/.env`.
+- **R-TEST-8** A minor-only change may use static review without adding or running tests. A change
+  to core implementation must run the narrowest relevant core tests before the full offline gate.
 
-Required gate before handoff:
+Required gate before handoff when core implementation changed:
 
 ```bash
 $UV run pytest
@@ -786,8 +825,9 @@ queries, retries, fallback crawlers, or inferred low-confidence records.
 2. Read the target modules, adjacent tests, config models, and relevant schema.
 3. State a short implementation plan for multi-file work.
 4. Implement the smallest complete vertical change.
-5. Add deterministic tests **before** any live validation.
-6. Run the §7.8 gate.
+5. For core implementation, add deterministic tests **before** any live validation. Skip new
+   tests for minor config, I/O, documentation, or forwarding changes.
+6. Run the §7.8 gate when core implementation changed; otherwise record static review only.
 7. Run bounded live validation only when requested or essential, and only within its run class (§7.9).
 8. Re-read the diff for secrets, unrelated edits, schema drift, and stale docs.
 9. Update this file's §0 status table, and `docs/api-notes.md` when external behaviour changes.
@@ -803,16 +843,16 @@ Git:        branch, whether a commit was created
 Remaining:  unresolved risks, next stage
 ```
 
-**Never report "done" when the gate was not run.** State which check could not run and what is
-therefore unverified.
+Never imply that tests ran when they did not. For core changes, state which gate was omitted and
+what remains unverified; for minor-only changes, static review is sufficient under R-TEST-8.
 
 ### Definition of done (any stage)
 
 - public service signature (§6) and CLI command implemented
 - terminal states and idempotent rerun behaviour defined
 - writes preserve raw and normalized provenance
-- unit and adapter tests cover success, single-attempt failure, skip, and resume
-- §7.8 gate passes
+- core unit and adapter tests cover success, single-attempt failure, skip, and resume
+- §7.8 gate passes when core implementation changed
 - bounded smoke validation passes when the stage uses an external service
 - README, this plan, and `docs/api-notes.md` match actual behaviour
 - secret, quota, licensing, and research-audit requirements still hold

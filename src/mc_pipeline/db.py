@@ -121,7 +121,7 @@ def _migration_1(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS ix_stories_title_norm ON stories(title_norm);
 
         -- Deduplication and QC verdicts depend on topic configuration (languages,
-        -- domain_allowlist, exclude_url_patterns, date range, near-duplicate blocking),
+        -- domain_allowlist, exclude_url_patterns, and date range),
         -- so they cannot live on the globally-keyed stories row: two topics that both
         -- return one story would overwrite each other's verdicts.
         CREATE TABLE story_topic_state (
@@ -393,6 +393,168 @@ def complete_pipeline_run(
             raise DatabaseError(f"Pipeline run {run_id} does not exist.")
 
 
+def topic_reachable_stories(connection: sqlite3.Connection, topic: str) -> list[sqlite3.Row]:
+    """Return each story reached by a topic's search windows exactly once."""
+    return connection.execute(
+        """
+        SELECT DISTINCT
+            stories.story_id,
+            stories.title,
+            stories.url,
+            stories.domain,
+            stories.publish_date,
+            stories.media_name,
+            stories.language
+        FROM search_hits
+        JOIN search_windows ON search_windows.id = search_hits.search_window_id
+        JOIN stories ON stories.story_id = search_hits.story_id
+        WHERE search_windows.topic = ?
+        ORDER BY stories.story_id ASC
+        """,
+        (topic,),
+    ).fetchall()
+
+
+def dedup_review_rows(connection: sqlite3.Connection, topic: str) -> list[sqlite3.Row]:
+    """Return deterministic Stage 2 review rows for every reachable topic story."""
+    return connection.execute(
+        """
+        WITH reachable_stories AS (
+            SELECT DISTINCT search_hits.story_id
+            FROM search_hits
+            JOIN search_windows ON search_windows.id = search_hits.search_window_id
+            WHERE search_windows.topic = ?
+        )
+        SELECT
+            stories.story_id,
+            stories.title,
+            stories.url,
+            stories.url_norm,
+            stories.title_norm,
+            stories.domain,
+            stories.publish_date,
+            stories.media_name,
+            stories.media_url,
+            stories.language,
+            stories.indexed_at,
+            stories.first_seen_at,
+            stories.last_seen_at,
+            story_topic_state.qc_status,
+            story_topic_state.qc_reason,
+            story_topic_state.dup_of_story_id,
+            duplicate_story.title AS duplicate_of_title,
+            duplicate_story.url AS duplicate_of_url,
+            duplicate_story.publish_date AS duplicate_of_publish_date,
+            story_topic_state.decided_at
+        FROM reachable_stories
+        JOIN stories ON stories.story_id = reachable_stories.story_id
+        LEFT JOIN story_topic_state
+            ON story_topic_state.topic = ?
+           AND story_topic_state.story_id = stories.story_id
+        LEFT JOIN stories AS duplicate_story
+            ON duplicate_story.story_id = story_topic_state.dup_of_story_id
+        ORDER BY stories.story_id ASC
+        """,
+        (topic, topic),
+    ).fetchall()
+
+
+def dedup_review_stats(connection: sqlite3.Connection, topic: str) -> Mapping[str, int]:
+    """Return aggregate Stage 2 outcomes for a topic's reachable stories."""
+    row = connection.execute(
+        """
+        WITH reachable_stories AS (
+            SELECT DISTINCT search_hits.story_id
+            FROM search_hits
+            JOIN search_windows ON search_windows.id = search_hits.search_window_id
+            WHERE search_windows.topic = ?
+        )
+        SELECT
+            COUNT(*) AS story_count,
+            COUNT(story_topic_state.story_id) AS decided_story_count,
+            COALESCE(SUM(story_topic_state.qc_status = 'ok'), 0) AS accepted_story_count,
+            COALESCE(SUM(story_topic_state.qc_status = 'dup'), 0) AS duplicate_story_count,
+            COALESCE(
+                SUM(
+                    story_topic_state.qc_status IS NOT NULL
+                    AND story_topic_state.qc_status NOT IN ('ok', 'dup')
+                ),
+                0
+            ) AS rejected_story_count,
+            COALESCE(SUM(story_topic_state.qc_reason = 'duplicate_url'), 0)
+                AS duplicate_url_count,
+            COALESCE(SUM(story_topic_state.qc_reason = 'duplicate_title'), 0)
+                AS duplicate_title_count
+        FROM reachable_stories
+        LEFT JOIN story_topic_state
+            ON story_topic_state.topic = ?
+           AND story_topic_state.story_id = reachable_stories.story_id
+        """,
+        (topic, topic),
+    ).fetchone()
+    if row is None:
+        raise DatabaseError("Failed to query dedup review statistics.")
+    return dict(zip(row.keys(), (int(value) for value in row), strict=True))
+
+
+def persist_topic_story_states(
+    connection: sqlite3.Connection,
+    *,
+    topic: str,
+    states: Sequence[Mapping[str, str | None]],
+) -> None:
+    """Atomically store a topic's current QC decisions and remove stale states."""
+    with transaction(connection):
+        connection.executemany(
+            """
+            UPDATE stories
+            SET url_norm = ?, title_norm = ?
+            WHERE story_id = ?
+            """,
+            [(state["url_norm"], state["title_norm"], state["story_id"]) for state in states],
+        )
+        connection.executemany(
+            """
+            INSERT INTO story_topic_state(
+                topic, story_id, qc_status, qc_reason, dup_of_story_id, decided_at
+            )
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(topic, story_id) DO UPDATE SET
+                qc_status = excluded.qc_status,
+                qc_reason = excluded.qc_reason,
+                dup_of_story_id = excluded.dup_of_story_id,
+                decided_at = CURRENT_TIMESTAMP
+            WHERE story_topic_state.qc_status IS NOT excluded.qc_status
+               OR story_topic_state.qc_reason IS NOT excluded.qc_reason
+               OR story_topic_state.dup_of_story_id IS NOT excluded.dup_of_story_id
+            """,
+            [
+                (
+                    topic,
+                    state["story_id"],
+                    state["qc_status"],
+                    state["qc_reason"],
+                    state["dup_of_story_id"],
+                )
+                for state in states
+            ],
+        )
+        connection.execute(
+            """
+            DELETE FROM story_topic_state
+            WHERE topic = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM search_hits
+                  JOIN search_windows ON search_windows.id = search_hits.search_window_id
+                  WHERE search_windows.topic = ?
+                    AND search_hits.story_id = story_topic_state.story_id
+              )
+            """,
+            (topic, topic),
+        )
+
+
 def get_search_window(
     connection: sqlite3.Connection,
     *,
@@ -504,8 +666,9 @@ def persist_search_page(
     stories: Sequence[Mapping[str, Any]],
     next_pagination_token: str | None,
     window_raw_json: str,
+    pagination_completed: bool = False,
 ) -> None:
-    """Atomically persist one search page, its hits, and resume token."""
+    """Atomically persist one search page and its terminal or resume state."""
     if page_number < 1:
         raise ValueError("page_number must be at least 1.")
 
@@ -572,45 +735,36 @@ def persist_search_page(
                 ),
             )
 
-        cursor = connection.execute(
-            """
-            UPDATE search_windows
-            SET pages_fetched = MAX(pages_fetched, ?),
-                next_pagination_token = ?,
-                raw_json = ?,
-                status = 'running',
-                pagination_completed = 0,
-                completed_at = NULL,
-                error = NULL
-            WHERE id = ?
-            """,
-            (page_number, next_pagination_token, window_raw_json, window_id),
-        )
-        if cursor.rowcount != 1:
-            raise DatabaseError(f"Search window {window_id} does not exist.")
-
-
-def mark_search_window_complete(
-    connection: sqlite3.Connection,
-    window_id: int,
-    *,
-    raw_json: str,
-) -> None:
-    """Mark a window complete only after its pagination token is exhausted."""
-    with transaction(connection):
-        cursor = connection.execute(
-            """
-            UPDATE search_windows
-            SET status = 'completed',
-                pagination_completed = 1,
-                next_pagination_token = NULL,
-                raw_json = ?,
-                completed_at = CURRENT_TIMESTAMP,
-                error = NULL
-            WHERE id = ?
-            """,
-            (raw_json, window_id),
-        )
+        if pagination_completed:
+            cursor = connection.execute(
+                """
+                UPDATE search_windows
+                SET pages_fetched = MAX(pages_fetched, ?),
+                    next_pagination_token = NULL,
+                    raw_json = ?,
+                    status = 'completed',
+                    pagination_completed = 1,
+                    completed_at = CURRENT_TIMESTAMP,
+                    error = NULL
+                WHERE id = ?
+                """,
+                (page_number, window_raw_json, window_id),
+            )
+        else:
+            cursor = connection.execute(
+                """
+                UPDATE search_windows
+                SET pages_fetched = MAX(pages_fetched, ?),
+                    next_pagination_token = ?,
+                    raw_json = ?,
+                    status = 'running',
+                    pagination_completed = 0,
+                    completed_at = NULL,
+                    error = NULL
+                WHERE id = ?
+                """,
+                (page_number, next_pagination_token, window_raw_json, window_id),
+            )
         if cursor.rowcount != 1:
             raise DatabaseError(f"Search window {window_id} does not exist.")
 

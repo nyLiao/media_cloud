@@ -36,6 +36,13 @@ def _search_module() -> ModuleType:
     return search
 
 
+def _dedup_module() -> ModuleType:
+    """Load the Stage 2 service only when the Stage 2 command runs."""
+    from . import dedup
+
+    return dedup
+
+
 def _exit_code(error: BaseException) -> int:
     """Translate typed pipeline errors to the documented CLI exit codes."""
     if isinstance(error, MissingCredentialError):
@@ -157,6 +164,28 @@ def search(
     _run_command(operation)
 
 
+@app.command("dedup")
+def deduplicate(
+    topic: Annotated[str, typer.Option("--topic", help="Configured topic name.")],
+    config_path: Annotated[
+        Path, typer.Option("--config", help="YAML configuration path.")
+    ] = DEFAULT_CONFIG_PATH,
+    db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DATABASE_PATH,
+) -> None:
+    """Deduplicate and quality-check persisted topic stories."""
+
+    def operation() -> None:
+        app_config = load_config(config_path)
+        connection = init_db(db)
+        try:
+            summary = _dedup_module().deduplicate_topic(app_config, topic, connection)
+        finally:
+            connection.close()
+        _echo_summary(summary)
+
+    _run_command(operation)
+
+
 @app.command("review-search")
 def review_search(
     topic: Annotated[str, typer.Option("--topic", help="Configured topic name.")],
@@ -180,6 +209,33 @@ def review_search(
             connection.close()
         _echo_summary(summary)
         typer.echo(f"Search review CSV: {review_output}")
+
+    _run_command(operation)
+
+
+@app.command("review-dedup")
+def review_dedup(
+    topic: Annotated[str, typer.Option("--topic", help="Configured topic name.")],
+    config_path: Annotated[
+        Path, typer.Option("--config", help="YAML configuration path.")
+    ] = DEFAULT_CONFIG_PATH,
+    db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DATABASE_PATH,
+    output: Annotated[Path | None, typer.Option("--output", help="Dedup-review CSV path.")] = None,
+) -> None:
+    """Export persisted Stage 2 QC and deduplication outcomes for review."""
+
+    def operation() -> None:
+        app_config = load_config(config_path)
+        review_output = output or Path("data/review") / f"{topic}-dedup.csv"
+        connection = connect_db_readonly(db)
+        try:
+            summary = _dedup_module().export_dedup_review(
+                app_config, topic, connection, output=review_output
+            )
+        finally:
+            connection.close()
+        _echo_summary(summary)
+        typer.echo(f"Dedup review CSV: {review_output}")
 
     _run_command(operation)
 

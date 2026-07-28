@@ -51,7 +51,6 @@ topics:
     qc:
       min_title_chars: 20
       exclude_url_patterns: ["/video/", "/live/", "/sports/", "/photo", "/tag/"]
-      near_dup_threshold: 92
     extraction:
       unit: person_transition
       relevance_criteria: >-

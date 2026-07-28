@@ -25,23 +25,26 @@ uv run mc-pipeline review-search \
 The command prints window and hit reconciliation totals, then writes one row per search hit.
 The same story can legitimately appear in more than one window; `duplicate_hits` reports this
 difference without deleting anything.
+Stage 2 and later reconciliation use distinct reachable stories, so repeated hits across windows
+are counted once before QC, deduplication, fetch, and extraction outcomes are summed.
 
 ## Manual Checklist
 
 Open `data/review/revolving_door_ca-search.csv` in a spreadsheet and check:
 
-1. Sort by `window_start`, `page_number`, and `result_rank`. Confirm the windows cover
-   `2021-01-01` through `2025-12-31` without unexpected gaps.
-2. Filter `pagination_completed` to `0`. A full successful run must have no matching rows;
-   inspect `search_windows.status` in SQLite if any window is incomplete.
+1. Filter to `window_start=2021-01-01` and `window_end=2025-12-31`. Confirm this configured
+   full-study partition is present; older 30-day recovery windows may remain in the same database.
+2. Within that full-study partition, confirm `pagination_completed=1`, eight page numbers, and
+   7,351 distinct story IDs. Legacy pending windows do not invalidate the completed partition.
 3. Filter blank `story_id`, `title`, `url`, or `publish_date` values. Missing provider metadata
    is retained for audit, but should be counted before Stage 2.
 4. Sort or filter `domain` and `media_name` to identify unexpected outlets or obvious scope
    problems. The configured collection remains the authoritative source scope.
 5. Search `title` for obviously irrelevant themes and note recurring false-positive patterns.
    Do not delete rows; later QC decisions belong in `story_topic_state`.
-6. Compare repeated `story_id` values across windows. These are preserved search hits, not a
-   Stage 1 error; Stage 2 performs deterministic deduplication.
+6. Compare repeated `story_id` values across windows. The current database intentionally retains
+   the earlier recovery windows as well as the full-study partition, so cross-window repetition is
+   provenance rather than a Stage 1 error; Stage 2 operates on distinct stories.
 7. Open a small sample of `url` values to judge query precision. Stage 1 stores metadata only,
    so article-text relevance cannot be fully assessed until Stage 3 fetches text.
 
@@ -53,9 +56,11 @@ sqlite3 -header -column data/mc.db \
    FROM search_windows WHERE topic='revolving_door_ca' GROUP BY status;"
 
 sqlite3 -header -column data/mc.db \
-  "SELECT COUNT(*) AS hits, COUNT(DISTINCT h.story_id) AS distinct_stories
+  "SELECT COUNT(*) AS hits, COUNT(DISTINCT h.story_id) AS distinct_stories,
+          COUNT(DISTINCT h.page_number) AS pages
    FROM search_hits h JOIN search_windows w ON w.id=h.search_window_id
-   WHERE w.topic='revolving_door_ca';"
+   WHERE w.topic='revolving_door_ca'
+     AND w.window_start='2021-01-01' AND w.window_end='2025-12-31';"
 
 sqlite3 -header -column data/mc.db \
   "SELECT window_start, window_end, relevant_count,

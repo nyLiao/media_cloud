@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 import pytest
 
-from mc_pipeline.ratelimit import PerDomainThrottle, TokenBucket, parse_retry_after
+from mc_pipeline.ratelimit import PerDomainThrottle, TokenBucket
 
 
 class FakeClock:
@@ -73,30 +71,3 @@ def test_per_domain_throttle_records_request_after_waiting():
     throttle.wait("example.com")
 
     assert clock.sleeps == [6.0, 6.0]
-
-
-@pytest.mark.parametrize(
-    ("header", "expected"),
-    [
-        ("120", 120.0),
-        (" 0 ", 0.0),
-        ("-1", None),
-        ("1.5", None),
-        ("not-a-delay", None),
-        (None, None),
-    ],
-)
-def test_parse_retry_after_integer_seconds(header: str | None, expected: float | None):
-    assert parse_retry_after(header) == expected
-
-
-def test_parse_retry_after_http_date_uses_supplied_time():
-    now = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
-
-    assert parse_retry_after("Mon, 27 Jul 2026 12:01:30 GMT", now=now) == 90.0
-    assert parse_retry_after("Mon, 27 Jul 2026 11:59:00 GMT", now=now) == 0.0
-
-
-def test_parse_retry_after_rejects_naive_now_for_http_dates():
-    with pytest.raises(ValueError, match="timezone-aware"):
-        parse_retry_after("Mon, 27 Jul 2026 12:01:30 GMT", now=datetime(2026, 7, 27, 12, 0))

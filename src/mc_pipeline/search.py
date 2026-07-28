@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import csv
 import json
-import platform as python_platform
 import sqlite3
-import subprocess
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from datetime import date, timedelta
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
@@ -25,7 +23,6 @@ from .config import AppConfig, MediaCloudConfig, TopicConfig
 from .db import (
     complete_pipeline_run,
     get_search_window,
-    mark_search_window_complete,
     mark_search_window_failed,
     persist_search_page,
     search_review_rows,
@@ -35,8 +32,8 @@ from .db import (
     upsert_search_window,
 )
 from .errors import ConfigError, MediaCloudError, MissingCredentialError
-from .identity import canonical_json, semantic_query_hash, sha256_hex, window_fingerprint
-from .stage import SearchReviewSummary, StageSummary
+from .identity import canonical_json, semantic_query_hash, window_fingerprint
+from .stage import SearchReviewSummary, StageSummary, build_provenance, package_version
 
 
 class SearchClient(Protocol):
@@ -97,51 +94,6 @@ def _topic(config: AppConfig, topic_name: str) -> TopicConfig:
     return topic
 
 
-def _package_version(package: str) -> str:
-    try:
-        return version(package)
-    except PackageNotFoundError:
-        return "unknown"
-
-
-def _git_revision() -> str:
-    try:
-        revision = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return "uncommitted"
-
-    dirty = subprocess.run(
-        ["git", "status", "--short"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    ).stdout.strip()
-    return f"{revision}-dirty" if dirty else revision
-
-
-def _provenance(config: AppConfig, topic_name: str) -> tuple[str, str, str, str]:
-    relevant_config = {
-        "media_cloud": config.media_cloud.model_dump(mode="json"),
-        "topic": config.topics[topic_name].model_dump(mode="json"),
-    }
-    config_json = canonical_json(relevant_config)
-    versions_json = canonical_json(
-        {
-            "python": python_platform.python_version(),
-            "media-cloud-pipeline": _package_version("media-cloud-pipeline"),
-            "mediacloud": _package_version("mediacloud"),
-        }
-    )
-    return sha256_hex(relevant_config), config_json, _git_revision(), versions_json
-
-
 def _default_client_factory(token: str) -> SearchClient:
     return cast(SearchClient, SearchApi(token))
 
@@ -199,10 +151,19 @@ def _normalized_story(story: Mapping[str, Any], result_rank: int) -> dict[str, A
 
     url = story.get("url")
     url_text = str(url) if url is not None else None
-    hostname = urlsplit(url_text).hostname if url_text else None
+    try:
+        hostname = urlsplit(url_text).hostname if url_text else None
+    except ValueError:
+        hostname = None
     publish_date = story.get("publish_date")
     indexed_date = story.get("indexed_date")
     text = story.get("text")
+    try:
+        raw_json = canonical_json(dict(story))
+    except TypeError as exc:
+        raise MediaCloudError(
+            "Media Cloud returned a story that is not JSON serializable."
+        ) from exc
     return {
         "story_id": story_id,
         "title": str(story["title"]) if story.get("title") is not None else None,
@@ -214,9 +175,47 @@ def _normalized_story(story: Mapping[str, Any], result_rank: int) -> dict[str, A
         "language": str(story["language"]) if story.get("language") is not None else None,
         "indexed_at": indexed_date.isoformat() if isinstance(indexed_date, date) else None,
         "mc_text": text if isinstance(text, str) else None,
-        "raw_json": canonical_json(dict(story)),
+        "raw_json": raw_json,
         "result_rank": result_rank,
     }
+
+
+def _request_detail(
+    config: AppConfig,
+    topic: TopicConfig,
+    window_start: date,
+    window_end: date,
+    *,
+    endpoint: str,
+    pagination_token: str | None = None,
+) -> str:
+    request: dict[str, Any] = {
+        "endpoint": endpoint,
+        "query": topic.query,
+        "start_date": window_start,
+        "end_date": window_end,
+        "collection_ids": topic.collection_ids,
+        "source_ids": topic.source_ids,
+        "platform": config.media_cloud.platform,
+    }
+    if endpoint == "story_list":
+        request.update(
+            {
+                "expanded": False,
+                "pagination_token": pagination_token,
+                "page_size": config.media_cloud.page_size,
+                "max_pages_per_window": config.media_cloud.max_pages_per_window,
+            }
+        )
+    return f"request={canonical_json(request)}"
+
+
+def _record_error(story: Mapping[str, Any], result_rank: int, error: str) -> dict[str, Any]:
+    try:
+        raw_json: str | None = canonical_json(dict(story))
+    except TypeError:
+        raw_json = None
+    return {"result_rank": result_rank, "error": error, "raw_json": raw_json}
 
 
 def _window_id(
@@ -244,7 +243,7 @@ def _window_id(
         languages_json=canonical_json(topic.languages),
         window_start=window_start.isoformat(),
         window_end=window_end.isoformat(),
-        mediacloud_version=_package_version("mediacloud"),
+        mediacloud_version=package_version("mediacloud"),
     )
 
 
@@ -261,11 +260,32 @@ def estimate_topic(
     topic = _topic(config, topic_name)
     windows = split_date_windows(topic.start_date, topic.end_date, config.media_cloud.window_days)
     if dry_run:
-        return StageSummary(topic_name, len(windows), 0, len(windows), 0)
+        skipped = 0
+        details: list[str] = []
+        for window_start, window_end in windows:
+            fingerprint = window_fingerprint(
+                **_window_inputs(config, topic, window_start, window_end)
+            )
+            existing = get_search_window(
+                connection,
+                topic=topic_name,
+                request_fingerprint=fingerprint,
+                window_start=window_start.isoformat(),
+                window_end=window_end.isoformat(),
+            )
+            if existing is not None and (
+                existing["pagination_completed"] or existing["relevant_count"] is not None
+            ):
+                skipped += 1
+                continue
+            details.append(
+                _request_detail(config, topic, window_start, window_end, endpoint="story_count")
+            )
+        return StageSummary(topic_name, len(windows), len(details), skipped, 0, tuple(details))
     if api_token is None:
         raise MissingCredentialError("Media Cloud credentials are required for estimate")
 
-    config_hash, config_json, git_revision, versions_json = _provenance(config, topic_name)
+    config_hash, config_json, git_revision, versions_json = build_provenance(config, topic_name)
     run_id = start_pipeline_run(
         connection,
         run_uuid=str(uuid.uuid4()),
@@ -297,9 +317,7 @@ def estimate_topic(
                 window_end=window_end.isoformat(),
             )
             if existing is not None and (
-                existing["pagination_completed"]
-                or existing["relevant_count"] is not None
-                or existing["status"] in {"failed", "page_limit"}
+                existing["pagination_completed"] or existing["relevant_count"] is not None
             ):
                 skipped += 1
                 continue
@@ -356,8 +374,9 @@ def estimate_topic(
                 raw_json=canonical_json(metadata),
             )
             succeeded += 1
-    except MediaCloudError as exc:
-        complete_pipeline_run(connection, run_id, status="failed", error=str(exc))
+    except BaseException as exc:
+        with suppress(Exception):
+            complete_pipeline_run(connection, run_id, status="failed", error=str(exc))
         raise
     complete_pipeline_run(connection, run_id, status="completed")
     return StageSummary(topic_name, len(windows), succeeded, skipped, failed)
@@ -382,6 +401,7 @@ def search_topic(
         windows = windows[:limit_windows]
     if dry_run:
         cached = 0
+        details: list[str] = []
         for window_start, window_end in windows:
             fingerprint = window_fingerprint(
                 **_window_inputs(config, topic, window_start, window_end)
@@ -393,12 +413,28 @@ def search_topic(
                 window_start=window_start.isoformat(),
                 window_end=window_end.isoformat(),
             )
-            cached += int(existing is not None and bool(existing["pagination_completed"]))
-        return StageSummary(topic_name, len(windows), 0, cached, 0)
+            if existing is not None and bool(existing["pagination_completed"]):
+                cached += 1
+                continue
+            details.append(
+                _request_detail(
+                    config,
+                    topic,
+                    window_start,
+                    window_end,
+                    endpoint="story_list",
+                    pagination_token=(
+                        cast(str | None, existing["next_pagination_token"])
+                        if existing is not None
+                        else None
+                    ),
+                )
+            )
+        return StageSummary(topic_name, len(windows), len(details), cached, 0, tuple(details))
     if api_token is None:
         raise MissingCredentialError("Media Cloud credentials are required for search")
 
-    config_hash, config_json, git_revision, versions_json = _provenance(config, topic_name)
+    config_hash, config_json, git_revision, versions_json = build_provenance(config, topic_name)
     run_id = start_pipeline_run(
         connection,
         run_uuid=str(uuid.uuid4()),
@@ -429,9 +465,7 @@ def search_topic(
                 window_start=window_start.isoformat(),
                 window_end=window_end.isoformat(),
             )
-            if existing is not None and (
-                existing["pagination_completed"] or existing["status"] in {"failed", "page_limit"}
-            ):
+            if existing is not None and existing["pagination_completed"]:
                 skipped += 1
                 continue
             window_id = _window_id(
@@ -457,6 +491,29 @@ def search_topic(
             page_number = int(current["pages_fetched"]) + 1
             token = cast(str | None, current["next_pagination_token"])
             metadata = _window_metadata(cast(str | None, current["raw_json"]))
+            pages_fetched = int(current["pages_fetched"])
+            stored_page_size = metadata.get("page_size")
+            if pages_fetched > 0 and token is None:
+                mark_search_window_failed(
+                    connection,
+                    window_id,
+                    status="failed",
+                    error="Unsafe resume state: pages exist but no pagination token is stored.",
+                    raw_json=canonical_json(metadata),
+                )
+                failed += 1
+                continue
+            if pages_fetched > 0 and stored_page_size != config.media_cloud.page_size:
+                mark_search_window_failed(
+                    connection,
+                    window_id,
+                    status="failed",
+                    error="Unsafe resume state: page size changed or was not recorded.",
+                    raw_json=canonical_json(metadata),
+                )
+                failed += 1
+                continue
+            metadata["page_size"] = config.media_cloud.page_size
             try:
                 while True:
                     if page_number > config.media_cloud.max_pages_per_window:
@@ -497,13 +554,14 @@ def search_topic(
                         tuple[list[Mapping[str, Any]], str | None],
                         _call_once(list_operation, operation_name="story_list"),
                     )
-                    normalized = [
-                        _normalized_story(
-                            story,
-                            (page_number - 1) * config.media_cloud.page_size + offset,
-                        )
-                        for offset, story in enumerate(stories, start=1)
-                    ]
+                    normalized: list[dict[str, Any]] = []
+                    record_errors: list[dict[str, Any]] = []
+                    for offset, story in enumerate(stories, start=1):
+                        result_rank = (page_number - 1) * config.media_cloud.page_size + offset
+                        try:
+                            normalized.append(_normalized_story(story, result_rank))
+                        except MediaCloudError as exc:
+                            record_errors.append(_record_error(story, result_rank, str(exc)))
                     pages = cast(list[dict[str, Any]], metadata["pages"])
                     pages.append(
                         {
@@ -511,6 +569,8 @@ def search_topic(
                             "page_number": page_number,
                             "elapsed_ms": round((time.monotonic() - started) * 1000),
                             "returned": len(stories),
+                            "persisted": len(normalized),
+                            "record_errors": record_errors,
                             "has_next_token": next_token is not None,
                         }
                     )
@@ -521,12 +581,10 @@ def search_topic(
                         stories=normalized,
                         next_pagination_token=next_token,
                         window_raw_json=canonical_json(metadata),
+                        pagination_completed=next_token is None,
                     )
                     token = next_token
                     if token is None:
-                        mark_search_window_complete(
-                            connection, window_id, raw_json=canonical_json(metadata)
-                        )
                         succeeded += 1
                         break
                     page_number += 1
@@ -539,8 +597,9 @@ def search_topic(
                     raw_json=canonical_json(metadata),
                 )
                 failed += 1
-    except MediaCloudError as exc:
-        complete_pipeline_run(connection, run_id, status="failed", error=str(exc))
+    except BaseException as exc:
+        with suppress(Exception):
+            complete_pipeline_run(connection, run_id, status="failed", error=str(exc))
         raise
     complete_pipeline_run(connection, run_id, status="completed")
     return StageSummary(topic_name, len(windows), succeeded, skipped, failed)

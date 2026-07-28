@@ -86,6 +86,10 @@ Observed Python types:
 The response included a pagination token. The returned titles did not necessarily contain
 the query terms, which confirms the search is not title-only for this query/index.
 
+Malformed records in an otherwise successful page do not fail the window. Valid records are
+persisted, while page metadata records each rejected result rank, error, and serializable raw
+payload. Invalid URL syntax is retained with a null domain and becomes `bad_url` during Stage 2 QC.
+
 ### Full page text
 
 `CONFIRMED` for this account.
@@ -103,8 +107,10 @@ must use direct live-page extraction for the current account and skip failures b
 
 The first production attempt demonstrated that fixed 30-day windows were too expensive for
 this study. Sixty-one count calls were made before search, then 47 result-page calls completed
-through `2024-11-10`. The database contains 5,564 distinct metadata stories and zero populated
-`mc_text` values. Windowing is a pipeline recovery choice, not a Media Cloud API requirement.
+through `2024-11-10`. A later full-range search completed in eight result pages and brought the
+database to 7,351 distinct metadata stories, equal to the sum of the earlier window estimates,
+with zero populated `mc_text` values. Windowing is a pipeline recovery choice, not a Media Cloud
+API requirement.
 
 The default is now one full-range partition with `page_size=1000`, no estimate prerequisite,
 and no automatic retries. Smaller date partitions are reserved for explicit recovery only.

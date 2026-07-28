@@ -60,7 +60,6 @@ class LLMConfig(StrictModel):
 class QCConfig(StrictModel):
     min_title_chars: int = Field(ge=0)
     exclude_url_patterns: list[str]
-    near_dup_threshold: int = Field(ge=0, le=100)
 
 
 class ExtractionField(StrictModel):
