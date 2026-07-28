@@ -8,6 +8,7 @@ tests.
 from __future__ import annotations
 
 import math
+import random
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -15,6 +16,7 @@ from email.utils import parsedate_to_datetime
 
 Clock = Callable[[], float]
 Sleeper = Callable[[float], None]
+IntervalSampler = Callable[[float, float], float]
 
 
 class TokenBucket:
@@ -24,16 +26,19 @@ class TokenBucket:
         self,
         rate_per_min: float,
         *,
+        capacity: float | None = None,
         clock: Clock = time.monotonic,
         sleeper: Sleeper = time.sleep,
     ) -> None:
         if not math.isfinite(rate_per_min) or rate_per_min <= 0:
             raise ValueError("rate_per_min must be a positive finite number")
+        if capacity is not None and (not math.isfinite(capacity) or capacity <= 0):
+            raise ValueError("capacity must be a positive finite number")
 
         self.rate_per_min = rate_per_min
         self._clock = clock
         self._sleeper = sleeper
-        self._capacity = max(1.0, rate_per_min)
+        self._capacity = max(1.0, rate_per_min) if capacity is None else capacity
         self._tokens = self._capacity
         self._last_refill = clock()
 
@@ -57,7 +62,7 @@ class TokenBucket:
 
 
 class PerDomainThrottle:
-    """Ensure requests to each domain are separated by a configured delay."""
+    """Randomize the delay between consecutive requests to each domain."""
 
     def __init__(
         self,
@@ -65,13 +70,15 @@ class PerDomainThrottle:
         *,
         clock: Clock = time.monotonic,
         sleeper: Sleeper = time.sleep,
+        random_uniform: IntervalSampler = random.uniform,
     ) -> None:
-        if not math.isfinite(delay_s) or delay_s < 0:
-            raise ValueError("delay_s must be a finite non-negative number")
+        if not math.isfinite(delay_s) or delay_s < 1.0:
+            raise ValueError("delay_s must be a finite number of at least 1.0")
 
         self.delay_s = delay_s
         self._clock = clock
         self._sleeper = sleeper
+        self._random_uniform = random_uniform
         self._last_request_monotonic: dict[str, float] = {}
 
     def wait(self, domain: str) -> None:
@@ -82,7 +89,8 @@ class PerDomainThrottle:
         now = self._clock()
         previous_request = self._last_request_monotonic.get(domain)
         if previous_request is not None:
-            remaining = self.delay_s - (now - previous_request)
+            target_interval = self._random_uniform(1.0, self.delay_s)
+            remaining = target_interval - (now - previous_request)
             if remaining > 0:
                 self._sleeper(remaining)
 

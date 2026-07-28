@@ -67,6 +67,7 @@ class DedupReviewSummary:
     undecided: int
     duplicate_urls: int
     duplicate_titles: int
+    sports_titles: int
     output_path: Path
 
     def __str__(self) -> str:
@@ -74,8 +75,22 @@ class DedupReviewSummary:
             f"topic={self.topic} stories={self.stories} decided={self.decided} "
             f"accepted={self.accepted} duplicates={self.duplicates} "
             f"rejected={self.rejected} undecided={self.undecided} "
-            f"duplicate_urls={self.duplicate_urls} duplicate_titles={self.duplicate_titles}"
+            f"duplicate_urls={self.duplicate_urls} duplicate_titles={self.duplicate_titles} "
+            f"sports_titles={self.sports_titles}"
         )
+
+
+@dataclass(frozen=True)
+class FetchReviewSummary:
+    """Bounded Stage 3 review export totals and destination."""
+
+    topic: str
+    limit: int
+    exported: int
+    output_path: Path
+
+    def __str__(self) -> str:
+        return f"topic={self.topic} limit={self.limit} exported={self.exported}"
 
 
 def package_version(package: str) -> str:

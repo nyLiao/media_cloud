@@ -3,16 +3,33 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 from .config import load_config, load_media_cloud_token
 from .db import connect_db_readonly, init_db
-from .errors import ConfigError, DatabaseError, MediaCloudError, MissingCredentialError
+from .errors import ConfigError, DatabaseError, FetchError, MediaCloudError, MissingCredentialError
+from .identity import canonical_json
+
+if TYPE_CHECKING:
+    from .fetch import FetchProgress
 
 app = typer.Typer(help="Media Cloud research pipeline.", no_args_is_help=True)
 
@@ -43,6 +60,77 @@ def _dedup_module() -> ModuleType:
     return dedup
 
 
+def _fetch_module() -> ModuleType:
+    """Load the Stage 3 service only when the Stage 3 command runs."""
+    from . import fetch
+
+    return fetch
+
+
+class _RichFetchProgressReporter:
+    """Render bounded Stage 3 progress without exposing titles or URLs."""
+
+    def __init__(self, *, enabled: bool) -> None:
+        self._console = Console(stderr=True)
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TextColumn("ok={task.fields[succeeded]} failed={task.fields[failed]}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=self._console,
+            disable=not enabled,
+        )
+        self._task_id: TaskID | None = None
+
+    def __call__(self, update: FetchProgress) -> None:
+        processed = update.processed
+        total = update.total
+        domain = " ".join(update.domain.split())[:60]
+        status = " ".join(update.status.split())[:24]
+        succeeded = update.succeeded
+        failed = update.failed
+        self._console.print(
+            canonical_json(
+                {
+                    "event": "fetch_entry",
+                    "processed": processed,
+                    "total": total,
+                    "story_id": update.story_id,
+                    "domain": domain,
+                    "status": status,
+                    "succeeded": succeeded,
+                    "failed": failed,
+                }
+            ),
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
+        if self._task_id is None:
+            self._progress.start()
+            self._task_id = self._progress.add_task(
+                "starting",
+                total=total,
+                succeeded=0,
+                failed=0,
+            )
+        self._progress.update(
+            self._task_id,
+            completed=processed,
+            description=f"{domain} [{status}]",
+            succeeded=succeeded,
+            failed=failed,
+        )
+
+    def close(self) -> None:
+        if self._task_id is not None:
+            self._progress.stop()
+
+
 def _exit_code(error: BaseException) -> int:
     """Translate typed pipeline errors to the documented CLI exit codes."""
     if isinstance(error, MissingCredentialError):
@@ -51,7 +139,7 @@ def _exit_code(error: BaseException) -> int:
         return 2
     if isinstance(error, DatabaseError):
         return 4
-    if isinstance(error, MediaCloudError):
+    if isinstance(error, (MediaCloudError, FetchError)):
         return 5
     raise error
 
@@ -60,7 +148,7 @@ def _run_command(operation: Callable[[], None]) -> None:
     """Run an operation and present known pipeline errors consistently."""
     try:
         operation()
-    except (ConfigError, DatabaseError, MediaCloudError) as error:
+    except (ConfigError, DatabaseError, MediaCloudError, FetchError) as error:
         typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(_exit_code(error)) from error
 
@@ -186,6 +274,55 @@ def deduplicate(
     _run_command(operation)
 
 
+@app.command("fetch")
+def fetch_articles(
+    topic: Annotated[str, typer.Option("--topic", help="Configured topic name.")],
+    config_path: Annotated[
+        Path, typer.Option("--config", help="YAML configuration path.")
+    ] = DEFAULT_CONFIG_PATH,
+    db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DATABASE_PATH,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", min=1, help="Process at most this many candidate stories."),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Preview candidates without network or database writes."),
+    ] = False,
+    progress: Annotated[
+        bool | None,
+        typer.Option(
+            "--progress/--no-progress",
+            help="Show or suppress interactive fetch progress (default: auto).",
+        ),
+    ] = None,
+) -> None:
+    """Acquire and cache full text for QC-passing stories."""
+
+    def operation() -> None:
+        app_config = load_config(config_path)
+        connection = _stage_connection(db, dry_run=dry_run)
+        progress_enabled = False
+        if not dry_run:
+            progress_enabled = sys.stderr.isatty() if progress is None else progress
+        reporter = _RichFetchProgressReporter(enabled=progress_enabled)
+        try:
+            summary = _fetch_module().fetch_topic(
+                app_config,
+                topic,
+                connection,
+                limit=limit,
+                dry_run=dry_run,
+                progress=reporter,
+            )
+        finally:
+            reporter.close()
+            connection.close()
+        _echo_summary(summary)
+
+    _run_command(operation)
+
+
 @app.command("review-search")
 def review_search(
     topic: Annotated[str, typer.Option("--topic", help="Configured topic name.")],
@@ -209,6 +346,46 @@ def review_search(
             connection.close()
         _echo_summary(summary)
         typer.echo(f"Search review CSV: {review_output}")
+
+    _run_command(operation)
+
+
+@app.command("review-fetch")
+def review_fetch(
+    topic: Annotated[str, typer.Option("--topic", help="Configured topic name.")],
+    limit: Annotated[
+        int,
+        typer.Option(
+            "--limit",
+            min=1,
+            max=100,
+            help="Export at most this many successful articles; required to prevent full-DB review.",
+        ),
+    ],
+    config_path: Annotated[
+        Path, typer.Option("--config", help="YAML configuration path.")
+    ] = DEFAULT_CONFIG_PATH,
+    db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DATABASE_PATH,
+    output: Annotated[Path | None, typer.Option("--output", help="Fetch-review CSV path.")] = None,
+) -> None:
+    """Export a bounded sample of successfully fetched article text."""
+
+    def operation() -> None:
+        app_config = load_config(config_path)
+        review_output = output or Path("data/review") / f"{topic}-fetch.csv"
+        connection = connect_db_readonly(db)
+        try:
+            summary = _fetch_module().export_fetch_review(
+                app_config,
+                topic,
+                connection,
+                limit=limit,
+                output=review_output,
+            )
+        finally:
+            connection.close()
+        _echo_summary(summary)
+        typer.echo(f"Fetch review CSV: {review_output}")
 
     _run_command(operation)
 

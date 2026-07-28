@@ -9,12 +9,16 @@ description = "Reproducible Media Cloud search-to-CSV research pipeline"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "beautifulsoup4>=4.13,<5",
+  "lxml>=5.4,<7",
   "mediacloud==5.1.0",
   "pydantic>=2.11,<3",
   "python-dotenv>=1.1,<2",
   "pyyaml>=6.0,<7",
+  "readability-lxml>=0.8.4,<1",
   "requests>=2.32,<3",
   "rich>=14,<15",
+  "trafilatura>=2.0,<3",
   "typer>=0.16,<1",
 ]
 

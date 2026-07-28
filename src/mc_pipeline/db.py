@@ -13,6 +13,7 @@ from .errors import DatabaseError
 
 SCHEMA_VERSION = 3
 BUSY_TIMEOUT_MS = 5000
+MAX_FETCH_REVIEW_LIMIT = 100
 _SAVEPOINT_COUNTER = count()
 
 
@@ -121,7 +122,7 @@ def _migration_1(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS ix_stories_title_norm ON stories(title_norm);
 
         -- Deduplication and QC verdicts depend on topic configuration (languages,
-        -- domain_allowlist, exclude_url_patterns, and date range),
+        -- domain_allowlist, exclude_url_patterns, exclude_title_terms, and date range),
         -- so they cannot live on the globally-keyed stories row: two topics that both
         -- return one story would overwrite each other's verdicts.
         CREATE TABLE story_topic_state (
@@ -415,6 +416,52 @@ def topic_reachable_stories(connection: sqlite3.Connection, topic: str) -> list[
     ).fetchall()
 
 
+def fetch_review_rows(connection: sqlite3.Connection, topic: str, limit: int) -> list[sqlite3.Row]:
+    """Return a bounded newest-first Stage 3 review sample for one topic."""
+    if not 1 <= limit <= MAX_FETCH_REVIEW_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_FETCH_REVIEW_LIMIT}")
+    return connection.execute(
+        """
+        WITH reachable_stories AS (
+            SELECT DISTINCT search_hits.story_id
+            FROM search_hits
+            JOIN search_windows ON search_windows.id = search_hits.search_window_id
+            WHERE search_windows.topic = ?
+        )
+        SELECT
+            ? AS topic,
+            stories.story_id,
+            stories.title,
+            stories.url,
+            stories.domain,
+            stories.publish_date,
+            stories.media_name,
+            articles.fetch_status,
+            articles.source,
+            articles.http_status,
+            articles.final_url,
+            articles.extractor,
+            articles.text,
+            articles.text_chars,
+            articles.attempts,
+            articles.error,
+            articles.fetched_at
+        FROM reachable_stories
+        JOIN story_topic_state
+            ON story_topic_state.topic = ?
+           AND story_topic_state.story_id = reachable_stories.story_id
+           AND story_topic_state.qc_status = 'ok'
+        JOIN stories ON stories.story_id = reachable_stories.story_id
+        JOIN articles
+            ON articles.story_id = stories.story_id
+           AND articles.fetch_status = 'ok'
+        ORDER BY articles.fetched_at DESC, stories.story_id ASC
+        LIMIT ?
+        """,
+        (topic, topic, topic, limit),
+    ).fetchall()
+
+
 def dedup_review_rows(connection: sqlite3.Connection, topic: str) -> list[sqlite3.Row]:
     """Return deterministic Stage 2 review rows for every reachable topic story."""
     return connection.execute(
@@ -484,7 +531,9 @@ def dedup_review_stats(connection: sqlite3.Connection, topic: str) -> Mapping[st
             COALESCE(SUM(story_topic_state.qc_reason = 'duplicate_url'), 0)
                 AS duplicate_url_count,
             COALESCE(SUM(story_topic_state.qc_reason = 'duplicate_title'), 0)
-                AS duplicate_title_count
+                AS duplicate_title_count,
+            COALESCE(SUM(story_topic_state.qc_status = 'sports_title'), 0)
+                AS sports_title_count
         FROM reachable_stories
         LEFT JOIN story_topic_state
             ON story_topic_state.topic = ?

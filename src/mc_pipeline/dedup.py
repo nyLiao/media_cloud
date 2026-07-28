@@ -142,11 +142,27 @@ def _is_allowed_domain(domain: str | None, allowlist: Iterable[str]) -> bool:
     )
 
 
+def _matching_title_term(title_norm: str | None, excluded_terms: Iterable[str]) -> str | None:
+    """Return the first configured normalized term matched on complete title tokens."""
+    if title_norm is None:
+        return None
+    title_tokens = title_norm.split()
+    for term in excluded_terms:
+        term_tokens = term.split()
+        width = len(term_tokens)
+        if any(
+            title_tokens[index : index + width] == term_tokens for index in range(len(title_tokens))
+        ):
+            return term
+    return None
+
+
 def _qc_reason(
     row: sqlite3.Row,
     topic: TopicConfig,
     *,
     url_norm: str | None,
+    title_norm: str | None,
 ) -> str | None:
     language = row["language"]
     allowed_languages = {item.casefold() for item in topic.languages}
@@ -167,6 +183,10 @@ def _qc_reason(
     title = row["title"]
     if not isinstance(title, str) or len(title.strip()) < topic.qc.min_title_chars:
         return "short_title"
+
+    excluded_term = _matching_title_term(title_norm, topic.qc.exclude_title_terms)
+    if excluded_term is not None:
+        return f"sports_title:{excluded_term}"
 
     if not _is_allowed_domain(_domain(url_norm), topic.domain_allowlist):
         return "off_domain"
@@ -249,6 +269,7 @@ def export_dedup_review(
         undecided=stories - decided,
         duplicate_urls=stats["duplicate_url_count"],
         duplicate_titles=stats["duplicate_title_count"],
+        sports_titles=stats["sports_title_count"],
         output_path=destination,
     )
 
@@ -264,12 +285,14 @@ def deduplicate_topic(
     for row in rows:
         url_norm = normalize_url(row["url"])
         title_norm = normalize_title(row["title"], row["media_name"])
-        reason = _qc_reason(row, topic, url_norm=url_norm)
+        reason = _qc_reason(row, topic, url_norm=url_norm, title_norm=title_norm)
         state: TopicState = {
             "story_id": row["story_id"],
             "url_norm": url_norm,
             "title_norm": title_norm,
-            "qc_status": "ok" if reason is None else reason,
+            "qc_status": "sports_title"
+            if reason and reason.startswith("sports_title:")
+            else ("ok" if reason is None else reason),
             "qc_reason": reason,
             "dup_of_story_id": None,
         }

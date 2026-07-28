@@ -181,9 +181,12 @@ Source:
 `CONFIRMED`
 
 - Use a `requests.Session` with automatic retries disabled.
-- Add a single-threaded per-domain monotonic-clock delay and a global request limiter.
+- Add a single-threaded per-domain monotonic-clock delay sampled uniformly from one second through
+  the configured maximum, plus a separate global request limiter.
 - Use `urllib.robotparser.RobotFileParser`; cache rules per domain.
 - Record every fetch attempt and terminal failure instead of dropping articles.
+- Cap live responses at five redirects and 5 MiB, and accept only HTML/XHTML content types.
+- Keep dry runs read-only and network-free; show dynamic progress only for interactive CLI output.
 
 ## OpenAI-compatible Proxy
 

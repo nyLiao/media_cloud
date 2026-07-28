@@ -2,8 +2,9 @@
 
 > **Agent quick start**
 >
-> - **Status:** foundation, Stage 1 Search, and Stage 2 Dedup/QC implemented. Stages 3–5 pending.
-> - **Next action:** review the Stage 1 CSV, then run `scripts/run_dedup_qc.sh` explicitly.
+> - **Status:** foundation and Stages 1–3 implemented. Stages 4–5 pending.
+> - **Next action:** configure the Stage 3 contact address, inspect a bounded fetch dry run, then
+>   launch `scripts/run_article_fetch.sh` explicitly.
 > - **Read before editing:** §0 (how to use this doc), §3 (invariants), §5 (data model), then the one stage section you are implementing.
 > - **Do not** run a full-range search, crawl, or LLM pass without explicit user approval.
 >
@@ -67,7 +68,7 @@ that satisfies the higher-priority source.
 | `ratelimit.py` | done | `src/mc_pipeline/ratelimit.py` |
 | Stage 1 Search | done | `src/mc_pipeline/search.py`, §6.1 |
 | Stage 2 Dedup/QC | done | `src/mc_pipeline/dedup.py`, §6.2 |
-| Stage 3 Fetch | pending | §6.3 |
+| Stage 3 Fetch | done | `src/mc_pipeline/fetch.py`, §6.3 |
 | Stage 4 Extract | pending | §6.4 |
 | Stage 5 Export | pending | §6.5 |
 
@@ -241,7 +242,7 @@ output contract.
 CREATE TABLE story_topic_state (
     topic           TEXT NOT NULL,
     story_id        TEXT NOT NULL REFERENCES stories(story_id) ON DELETE CASCADE,
-    qc_status       TEXT,           -- ok|dup|bad_lang|off_domain|bad_url|short_title|out_of_range
+    qc_status       TEXT,           -- ok|dup|bad_lang|off_domain|bad_url|short_title|sports_title|out_of_range
     qc_reason       TEXT,
     dup_of_story_id TEXT REFERENCES stories(story_id) ON DELETE SET NULL,
     decided_at      TEXT,
@@ -400,9 +401,10 @@ Pure function of the database — no network, no credentials, free to rerun afte
   fragments, trailing slash.
 - **S2-R3** Normalize titles: case-fold, collapse punctuation and whitespace, strip outlet
   suffixes (`" | CBC News"`, `" - The Globe and Mail"`, `" — National Post"`).
-- **S2-R4** Apply language, date-range, URL-pattern, title-length, and optional domain rules before
-  duplicate grouping. Rejected rows are not canonical candidates. An empty `domain_allowlist`
-  means no extra domain filter — the collection already scopes sources.
+- **S2-R4** Apply language, date-range, URL-pattern, title-length, configured normalized complete
+  title terms, and optional domain rules before duplicate grouping. Terms match contiguous whole
+  tokens, never substrings. Rejected rows are not canonical candidates. An empty
+  `domain_allowlist` means no extra domain filter — the collection already scopes sources.
 - **S2-R5** Deduplication order among QC-passing rows is URL duplicates → exact-title duplicates.
   Do not enable fuzzy near-duplicate removal by default: an uncertain match must be retained rather
   than silently discard a possible case. Add it only if manually reviewed fixtures establish a
@@ -412,8 +414,8 @@ Pure function of the database — no network, no credentials, free to rerun afte
 - **S2-R7** Only deterministic, high-confidence `qc_status='ok'` rows proceed. Rejected metadata
   may remain in the cache for quota safety but is excluded from all downstream work.
 - **S2-R8** The current corpus demonstrates the expected payoff: exact-title groups alone can
-  remove up to 2,173 redundant downstream fetches, while configured `/sports/`, language, and
-  short-title rules reject obvious failures without another external query.
+  remove up to 2,173 redundant downstream fetches, while configured sports URL/title terms,
+  language, and short-title rules reject obvious failures without another external query.
 
 **Done when:** deterministic on fixtures · idempotent on rerun · two topics can hold different
 `qc_status` for the same story (the C1 regression test).
@@ -430,6 +432,7 @@ def fetch_topic(
     *,
     limit: int | None = None,
     dry_run: bool = False,
+    progress: ProgressReporter | None = None,
 ) -> StageSummary: ...
 ```
 
@@ -447,7 +450,8 @@ Order of acquisition:
 
 - **S3-R1** Extractors never fetch URLs; the pipeline owns every request.
 - **S3-R2** Check cached robots rules before a domain's first request.
-- **S3-R3** Apply global and per-domain limits before each live request.
+- **S3-R3** Apply the global limit before each live request. For repeated requests to one domain,
+  sample a fresh delay uniformly between one second and `per_domain_delay_s`.
 - **S3-R4** Configure a real contact address in `user_agent` before production crawling.
 - **S3-R5** Do not retry. Cap redirects, response bytes, and total request time.
 - **S3-R6** Accept HTML-like content types only; record anything else.
@@ -463,6 +467,11 @@ Order of acquisition:
 - **S3-R12** Start with a user-selected `--limit` batch and inspect fetch yield before expanding.
   With 96 domains and observed 403/404 outcomes, bounded batches minimize failed requests and make
   outlet-specific problems visible before a long run.
+- **S3-R13** `--dry-run` uses the live selection and priority rules but performs no database or
+  filesystem mutation, sleeping, robots request, or article request. Preview output is bounded.
+- **S3-R14** Interactive CLI runs show sanitized Rich progress automatically; redirected launcher
+  logs disable the dynamic display. Every selected story emits a structured entry log, followed
+  by the final reconciliation summary.
 
 **Done when:** mocked success and single-attempt failure paths are covered · one domain's delay
 is observably respected under a fake clock · failed rows remain skipped unless the user starts
@@ -662,9 +671,9 @@ $UV run ruff format . && $UV run ruff check . && $UV run mypy src
 
 - **R-DEP-1** Prefer the standard library or an existing dependency.
 - **R-DEP-2** Add one only when it materially simplifies a domain problem; justify in `pyproject.toml`.
-- **R-DEP-3** Add fetch/extract/export dependencies when those stages are implemented, so the
-  lock file reflects real code. Expected later additions: `requests`, `trafilatura`,
-  `readability-lxml`, `beautifulsoup4`, `lxml`, `tenacity`, `rapidfuzz`, `openai`, `tiktoken`.
+- **R-DEP-3** Add stage dependencies only when their code is implemented, so the lock file reflects
+  real code. Stage 3 uses `requests`, `trafilatura`, `readability-lxml`, `beautifulsoup4`, and
+  `lxml`; expected later additions include `tenacity`, `rapidfuzz`, `openai`, and `tiktoken`.
 
 ### 7.7 Rate limiting (`ratelimit.py`)
 
@@ -740,7 +749,9 @@ mc-pipeline resolve-sources --name Canada
 mc-pipeline estimate        --topic revolving_door_ca
 mc-pipeline search          --topic revolving_door_ca [--limit-windows N]
 mc-pipeline dedup           --topic revolving_door_ca
-mc-pipeline fetch           --topic revolving_door_ca [--limit N]
+mc-pipeline fetch           --topic revolving_door_ca [--limit N] [--dry-run]
+                            [--progress | --no-progress]
+mc-pipeline review-fetch    --topic revolving_door_ca --limit N
 mc-pipeline extract         --topic revolving_door_ca [--limit N] [--articles-per-request K]
 mc-pipeline export          --topic revolving_door_ca
 mc-pipeline status          --topic revolving_door_ca

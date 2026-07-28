@@ -28,6 +28,7 @@ Stage 1 search windows:
 - `duplicates` has `qc_status=dup`; `duplicate_urls` and `duplicate_titles` split the matching
   rule used.
 - `rejected` failed QC before deduplication, with the reason in `qc_reason`.
+- `sports_titles` is the subset of `rejected` with `qc_status=sports_title`.
 - `undecided` is reachable from Stage 1 but has no Stage 2 state, usually because `dedup` has not
   yet run after new search results were stored.
 
@@ -41,9 +42,12 @@ Open `data/review/revolving_door_ca-dedup.csv` in a spreadsheet and check:
 1. Confirm `undecided=0` before starting Stage 3. Rerun `dedup` if Stage 1 has added stories.
 2. Filter `qc_status=dup` and compare each row with its `dup_of_story_id`; the canonical story
    is chosen deterministically by earliest publish date, then story ID.
-3. Review `qc_reason=bad_lang`, `out_of_range`, `bad_url`, `short_title`, and `off_domain` for
-   expected scope decisions. Adjust `topics.<name>.qc` or `domain_allowlist` only when the rule,
-   rather than an individual outcome, is incorrect.
+3. Review `qc_reason=bad_lang`, `out_of_range`, `bad_url`, `short_title`, `off_domain`, and
+   `sports_title:<term>` for expected scope decisions. `exclude_title_terms` matches normalized,
+   contiguous complete title terms—not substrings—and defaults to `hockey`, `football`, `soccer`,
+   `basketball`, `baseball`, `nhl`, `nfl`, `cfl`, `nba`, and `mlb` for the current topic. Adjust
+   `topics.<name>.qc` or `domain_allowlist` only when the rule, rather than an individual outcome,
+   is incorrect.
 4. Filter `qc_status=ok` to see the exact population Stage 3 can fetch. Do not edit the CSV;
    rerun Stage 2 after changing configuration so the database preserves provenance.
 

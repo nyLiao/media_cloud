@@ -10,7 +10,15 @@ from typing import Literal
 
 import yaml
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .errors import ConfigError, MissingCredentialError
 
@@ -33,9 +41,11 @@ class MediaCloudConfig(StrictModel):
 
 class FetchConfig(StrictModel):
     user_agent: str
-    per_domain_delay_s: float = Field(ge=0)
+    per_domain_delay_s: float = Field(ge=1)
     global_max_rps: float = Field(gt=0)
     timeout_s: float = Field(gt=0)
+    max_redirects: int = Field(gt=0)
+    max_response_bytes: int = Field(gt=0)
     max_retries: int = Field(ge=0)
     respect_robots: bool
     wayback_fallback: bool
@@ -60,6 +70,21 @@ class LLMConfig(StrictModel):
 class QCConfig(StrictModel):
     min_title_chars: int = Field(ge=0)
     exclude_url_patterns: list[str]
+    exclude_title_terms: list[str] = Field(default_factory=list)
+
+    @field_validator("exclude_title_terms")
+    @classmethod
+    def validate_exclude_title_terms(cls, terms: list[str]) -> list[str]:
+        """Normalize unique title terms for deterministic complete-token matching."""
+        normalized_terms = [
+            " ".join("".join(char if char.isalnum() else " " for char in term.casefold()).split())
+            for term in terms
+        ]
+        if any(not term for term in normalized_terms):
+            raise ValueError("exclude_title_terms must contain at least one alphanumeric character")
+        if len(set(normalized_terms)) != len(normalized_terms):
+            raise ValueError("exclude_title_terms must not contain duplicates")
+        return normalized_terms
 
 
 class ExtractionField(StrictModel):
@@ -119,6 +144,7 @@ class TopicConfig(StrictModel):
     source_ids: list[int] = Field(default_factory=list)
     languages: list[str]
     domain_allowlist: list[str]
+    fetch_priority_title_terms: list[str] = Field(default_factory=list)
     qc: QCConfig
     extraction: ExtractionConfig
 

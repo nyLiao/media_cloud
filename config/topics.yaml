@@ -9,10 +9,12 @@ media_cloud:
   max_retries: 0
 
 fetch:
-  user_agent: "media-cloud-research/0.1 (+mailto:you@example.org)"
-  per_domain_delay_s: 3.0
-  global_max_rps: 2.0
+  user_agent: "media-cloud-research/0.1 (+mailto:tikejar222@gwshare.com)"
+  per_domain_delay_s: 5.0
+  global_max_rps: 0.5
   timeout_s: 30
+  max_redirects: 5
+  max_response_bytes: 5242880
   max_retries: 0
   respect_robots: true
   wayback_fallback: false
@@ -48,9 +50,12 @@ topics:
     languages: [en]
     # An empty allowlist disables an additional domain filter. The collection scopes sources.
     domain_allowlist: []
+    fetch_priority_title_terms: ["revolving door", "lobby", "lobbyist", "lobbying"]
     qc:
       min_title_chars: 20
       exclude_url_patterns: ["/video/", "/live/", "/sports/", "/photo", "/tag/"]
+      # Normalized complete title terms only; "football" does not match "footballer".
+      exclude_title_terms: [hockey, football, soccer, basketball, baseball, rookie, nhl, nfl, cfl, nba, mlb]
     extraction:
       unit: person_transition
       relevance_criteria: >-

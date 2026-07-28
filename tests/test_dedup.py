@@ -100,6 +100,62 @@ def test_normalizers_remove_only_tracking_and_outlet_suffixes():
     assert normalize_url("https://[invalid/story") is None
 
 
+def test_sports_title_terms_reject_whole_words_and_normalized_phrases(tmp_path):
+    connection = init_db(tmp_path / "sports-title.db")
+    output = tmp_path / "dedup-review.csv"
+    try:
+        config = configured_for_dedup()
+        phrase_topic = config.topics["revolving_door_ca"].model_copy(
+            update={
+                "qc": config.topics["revolving_door_ca"].qc.model_copy(
+                    update={"exclude_title_terms": ["national hockey league"]}
+                )
+            }
+        )
+        phrase_config = config.model_copy(update={"topics": {"phrase": phrase_topic}})
+        seed_topic_stories(
+            connection,
+            "phrase",
+            [
+                story("phrase", title="National-Hockey League lobby rules change"),
+                story("near-phrase", title="National hockey leaguee lobby rules change"),
+            ],
+        )
+
+        deduplicate_topic(phrase_config, "phrase", connection)
+        phrase_rows = state_rows(connection, "phrase")
+        assert [tuple(row[:4]) for row in phrase_rows] == [
+            ("near-phrase", "ok", None, None),
+            ("phrase", "sports_title", "sports_title:national hockey league", None),
+        ]
+
+        seed_topic_stories(
+            connection,
+            "revolving_door_ca",
+            [
+                story("football", title="Football-lobby rules change"),
+                story("nba", title="NBA lobby rules change"),
+                story("footballer", title="A footballer discusses lobbying rules"),
+            ],
+        )
+
+        deduplicate_topic(config, "revolving_door_ca", connection)
+        summary = export_dedup_review(config, "revolving_door_ca", connection, output=output)
+
+        assert [tuple(row[:4]) for row in state_rows(connection, "revolving_door_ca")] == [
+            ("football", "sports_title", "sports_title:football", None),
+            ("footballer", "ok", None, None),
+            ("nba", "sports_title", "sports_title:nba", None),
+        ]
+        assert (summary.accepted, summary.rejected, summary.sports_titles) == (1, 2, 2)
+        with output.open(encoding="utf-8", newline="") as handle:
+            rows = {row["story_id"]: row for row in csv.DictReader(handle)}
+        assert rows["football"]["qc_status"] == "sports_title"
+        assert rows["football"]["qc_reason"] == "sports_title:football"
+    finally:
+        connection.close()
+
+
 def test_canonical_falls_back_to_story_id_when_publish_date_is_missing():
     first = {
         "story_id": "a",
@@ -213,7 +269,8 @@ def test_dedup_review_export_is_deterministic_and_reconciles_outcomes(tmp_path):
             summary.undecided,
             summary.duplicate_urls,
             summary.duplicate_titles,
-        ) == (3, 3, 1, 1, 1, 0, 1, 0)
+            summary.sports_titles,
+        ) == (3, 3, 1, 1, 1, 0, 1, 0, 0)
         with output.open(encoding="utf-8", newline="") as handle:
             rows = list(csv.DictReader(handle))
         assert [row["story_id"] for row in rows] == [

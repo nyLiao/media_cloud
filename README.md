@@ -49,8 +49,11 @@ All three commands accept `--config` and `--db`; `estimate` and `search` also ac
 ## Stage 2: Deduplicate and QC
 
 Stage 2 is an offline, deterministic database pass. It applies the topic's language, date,
-URL, title-length, and optional domain rules before removing normalized URL and exact-title
-duplicates. It never calls Media Cloud, fetches article pages, or loads credentials.
+URL, title-length, configured title terms, and optional domain rules before removing normalized
+URL and exact-title duplicates. The default `qc.exclude_title_terms` excludes `hockey`,
+`football`, `soccer`, `basketball`, `baseball`, `nhl`, `nfl`, `cfl`, `nba`, and `mlb`. Matching
+uses normalized complete terms, so `footballer` is not excluded. It never calls Media Cloud,
+fetches article pages, or loads credentials.
 
 Run it explicitly after reviewing the Stage 1 metadata:
 
@@ -65,10 +68,61 @@ The script writes a timestamped log under `data/logs/`. The underlying command a
 uv run mc-pipeline dedup --topic revolving_door_ca --db data/mc.db
 ```
 
+Inspect the resulting decisions before Stage 3:
+
+```bash
+uv run mc-pipeline review-dedup --topic revolving_door_ca
+```
+
+`review-dedup` is read-only, needs no credentials, and writes
+`data/review/<topic>-dedup.csv` by default. It reports accepted canonical stories, duplicates by
+matching rule, QC rejections, and any reachable stories without a Stage 2 decision. See
+`docs/dedup-review.md` for the review workflow.
+
 Media Cloud standard results contain metadata only for this account. The completed full-study
 search stored 7,351 distinct stories in eight pages with zero Media Cloud text values. Stage 3
-therefore uses one direct article-page request when implemented and skips blocked, missing, or
-short pages; Wayback and retries are off by default.
+therefore uses one direct article-page request and skips blocked, missing, or short pages;
+Wayback and retries are off by default.
+
+## Stage 3: Acquire Article Text
+
+Stage 3 reads only Stage 2 rows with `qc_status='ok'`. Inspect the deterministic priority order
+and bounded candidate batch without database writes, filesystem changes, sleeping, robots
+requests, or article requests:
+
+```bash
+uv run mc-pipeline fetch --topic revolving_door_ca --limit 25 --dry-run
+```
+
+Before a live fetch, ensure `fetch.user_agent` contains a real contact address. Run the bounded
+user launcher after reviewing the dry run:
+
+```bash
+scripts/run_article_fetch.sh --topic revolving_door_ca --limit 25
+```
+
+The launcher disables the dynamic progress bar to keep its timestamped log readable. Direct
+interactive CLI runs show Rich progress automatically; use `--progress` or `--no-progress` to
+override detection. Every selected story emits a structured `fetch_entry` log line in live and
+dry-run modes. Raw pages are stored atomically as gzip files under `data/raw_html/`.
+Successful text is cached globally by story, while robots denials, blocked pages, unsupported
+content, transport failures, and short text remain distinct terminal outcomes.
+
+Repeated requests to the same domain use a fresh random interval between one second and
+`fetch.per_domain_delay_s`. The separate `fetch.global_max_rps` token bucket continues to cap the
+overall request rate across all domains.
+
+Review only a bounded set of successfully fetched articles without network access or a
+full-database export. `--limit` is required, capped at 100, and rows are ordered by newest fetch
+activity first:
+
+```bash
+uv run mc-pipeline review-fetch --topic revolving_door_ca --limit 25
+```
+
+The command writes `data/review/<topic>-fetch.csv` by default and includes the stored extracted
+article text directly. Failed or blocked fetches and raw HTML paths are excluded. Use `--output`
+to choose another path.
 
 The LLM extraction contract is intentionally limited to `person_name`, `cohort_name`,
 `private_org`, `private_time`, `public_org`, `public_time`, and `jurisdiction`. Preview the exact
@@ -96,8 +150,9 @@ part of the gate.
 The current implementation establishes repository configuration, the versioned SQLite schema,
 deterministic hashing and identifiers (`identity.py`), the config-derived extraction contract
 (`contracts.py`), resumable Stage 1 Media Cloud search with a metadata review export, and
-topic-scoped Stage 2 deduplication/QC. Article acquisition, LLM extraction, and final case CSV
-export are implemented in later stages described in `PLAN.md`.
+topic-scoped Stage 2 deduplication/QC, and bounded Stage 3 article acquisition with dry-run and
+interactive progress support. LLM extraction and final case CSV export are implemented in later
+stages described in `PLAN.md`.
 
 `config/topics.yaml` drives behaviour: `extraction.fields` alone determines the JSON Schema
 sent to the model, the validation model, and the exported CSV columns, so adding a field is a
