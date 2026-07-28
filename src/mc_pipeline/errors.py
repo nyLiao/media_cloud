@@ -9,6 +9,10 @@ class ConfigError(PipelineError):
     """Raised when project configuration or required credentials are invalid."""
 
 
+class MissingCredentialError(ConfigError):
+    """Raised when a stage-specific credential is not configured."""
+
+
 class DatabaseError(PipelineError):
     """Raised when database setup, migration, or access fails."""
 

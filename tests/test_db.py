@@ -6,8 +6,24 @@ import sqlite3
 import pytest
 from typer.testing import CliRunner
 
+import mc_pipeline.db as db_module
 from mc_pipeline.cli import app
-from mc_pipeline.db import BUSY_TIMEOUT_MS, SCHEMA_VERSION, init_db
+from mc_pipeline.db import (
+    BUSY_TIMEOUT_MS,
+    SCHEMA_VERSION,
+    complete_pipeline_run,
+    connect_db_readonly,
+    get_search_window,
+    init_db,
+    mark_search_window_complete,
+    mark_search_window_failed,
+    persist_search_page,
+    search_review_rows,
+    search_review_stats,
+    start_pipeline_run,
+    update_search_window_estimate,
+    upsert_search_window,
+)
 from mc_pipeline.errors import DatabaseError
 
 
@@ -183,6 +199,237 @@ def test_init_db_migration_is_idempotent(tmp_path):
         second.close()
 
 
+def test_migrations_add_resume_token_and_simplified_case_columns(tmp_path):
+    database_path = tmp_path / "pipeline.db"
+    version_one = sqlite3.connect(database_path)
+    try:
+        db_module._migration_1(version_one)
+        version_one.execute("PRAGMA user_version = 1")
+        version_one.commit()
+        assert "next_pagination_token" not in _columns(version_one, "search_windows")
+    finally:
+        version_one.close()
+
+    connection = init_db(database_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert "next_pagination_token" in _columns(connection, "search_windows")
+        assert {"private_org", "private_time", "public_org", "public_time"} <= _columns(
+            connection, "cases"
+        )
+    finally:
+        connection.close()
+
+
+def test_search_repository_persists_provenance_and_review_data(tmp_path):
+    connection = init_db(tmp_path / "pipeline.db")
+    try:
+        run_id = start_pipeline_run(
+            connection,
+            run_uuid="run-1",
+            topic="door",
+            stage="search",
+            config_hash="config-hash",
+            config_json='{"topic":"door"}',
+            git_revision="abc123",
+            package_versions_json='{"mediacloud":"5.1.0"}',
+            raw_json='{"command":"search"}',
+        )
+        window_id = upsert_search_window(
+            connection,
+            pipeline_run_id=run_id,
+            topic="door",
+            query_hash="query-hash",
+            request_fingerprint="request-fingerprint",
+            query="revolving door",
+            platform="onlinenews-mediacloud",
+            collection_ids_json="[34411583]",
+            source_ids_json="[]",
+            languages_json='["en"]',
+            window_start="2026-01-01",
+            window_end="2026-01-31",
+            mediacloud_version="5.1.0",
+        )
+        assert (
+            upsert_search_window(
+                connection,
+                pipeline_run_id=run_id,
+                topic="door",
+                query_hash="query-hash",
+                request_fingerprint="request-fingerprint",
+                query="revolving door",
+                platform="onlinenews-mediacloud",
+                collection_ids_json="[34411583]",
+                source_ids_json="[]",
+                languages_json='["en"]',
+                window_start="2026-01-01",
+                window_end="2026-01-31",
+                mediacloud_version="5.1.0",
+            )
+            == window_id
+        )
+        update_search_window_estimate(
+            connection,
+            window_id,
+            relevant_count=2,
+            total_count=3,
+            raw_json='{"relevant":2,"total":3}',
+        )
+        persist_search_page(
+            connection,
+            window_id=window_id,
+            page_number=1,
+            stories=[
+                {
+                    "story_id": "story-2",
+                    "title": "Second result",
+                    "url": "https://example.test/2",
+                    "result_rank": 2,
+                    "raw_json": '{"id":"story-2"}',
+                },
+                {
+                    "story_id": "story-1",
+                    "title": "First result",
+                    "url": "https://example.test/1",
+                    "result_rank": 1,
+                    "raw_json": '{"id":"story-1"}',
+                },
+            ],
+            next_pagination_token="opaque-token",
+            window_raw_json='{"page":1}',
+        )
+
+        window = get_search_window(
+            connection,
+            topic="door",
+            request_fingerprint="request-fingerprint",
+            window_start="2026-01-01",
+            window_end="2026-01-31",
+        )
+        assert window is not None
+        assert dict(window)["next_pagination_token"] == "opaque-token"
+        assert dict(window)["pages_fetched"] == 1
+        assert dict(window)["raw_json"] == '{"page":1}'
+
+        rows = search_review_rows(connection, "door")
+        assert [(row["story_id"], row["result_rank"]) for row in rows] == [
+            ("story-1", 1),
+            ("story-2", 2),
+        ]
+        assert rows[0]["raw_json"] == '{"id":"story-1"}'
+        assert rows[0]["hit_raw_json"] == '{"id":"story-1"}'
+        assert search_review_stats(connection, "door") == {
+            "window_count": 1,
+            "completed_window_count": 0,
+            "failed_window_count": 0,
+            "page_limit_window_count": 0,
+            "pages_fetched": 1,
+            "hit_count": 2,
+            "story_count": 2,
+        }
+
+        mark_search_window_complete(connection, window_id, raw_json='{"page":"final"}')
+        complete_pipeline_run(connection, run_id, status="completed")
+
+        completed = connection.execute(
+            "SELECT status, pagination_completed, next_pagination_token, raw_json "
+            "FROM search_windows WHERE id = ?",
+            (window_id,),
+        ).fetchone()
+        assert tuple(completed) == ("completed", 1, None, '{"page":"final"}')
+        assert tuple(
+            connection.execute(
+                "SELECT status, error, completed_at IS NOT NULL FROM pipeline_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        ) == ("completed", None, 1)
+    finally:
+        connection.close()
+
+
+def test_search_page_write_rolls_back_and_page_limit_preserves_token(tmp_path):
+    connection = init_db(tmp_path / "pipeline.db")
+    try:
+        run_id = start_pipeline_run(
+            connection,
+            run_uuid="run-1",
+            topic="door",
+            stage="search",
+            config_hash="config-hash",
+            config_json="{}",
+            git_revision=None,
+            package_versions_json="{}",
+        )
+        window_id = upsert_search_window(
+            connection,
+            pipeline_run_id=run_id,
+            topic="door",
+            query_hash="query-hash",
+            request_fingerprint="request-fingerprint",
+            query="revolving door",
+            platform="onlinenews-mediacloud",
+            collection_ids_json="[34411583]",
+            source_ids_json="[]",
+            languages_json="[]",
+            window_start="2026-02-01",
+            window_end="2026-02-28",
+            mediacloud_version="5.1.0",
+        )
+
+        with pytest.raises(KeyError, match="raw_json"):
+            persist_search_page(
+                connection,
+                window_id=window_id,
+                page_number=1,
+                stories=[
+                    {"story_id": "story-1", "raw_json": '{"id":"story-1"}'},
+                    {"story_id": "story-2"},
+                ],
+                next_pagination_token="opaque-token",
+                window_raw_json='{"page":1}',
+            )
+
+        assert connection.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM search_hits").fetchone()[0] == 0
+        assert tuple(
+            connection.execute(
+                "SELECT pages_fetched, next_pagination_token FROM search_windows WHERE id = ?",
+                (window_id,),
+            ).fetchone()
+        ) == (0, None)
+
+        persist_search_page(
+            connection,
+            window_id=window_id,
+            page_number=1,
+            stories=[{"story_id": "story-1", "raw_json": '{"id":"story-1"}'}],
+            next_pagination_token="opaque-token",
+            window_raw_json='{"page":1}',
+        )
+        mark_search_window_failed(
+            connection,
+            window_id,
+            status="page_limit",
+            error="configured page limit reached",
+            raw_json='{"reason":"page_limit"}',
+        )
+
+        limited = connection.execute(
+            "SELECT status, error, next_pagination_token, pagination_completed, raw_json "
+            "FROM search_windows WHERE id = ?",
+            (window_id,),
+        ).fetchone()
+        assert tuple(limited) == (
+            "page_limit",
+            "configured page limit reached",
+            "opaque-token",
+            0,
+            '{"reason":"page_limit"}',
+        )
+    finally:
+        connection.close()
+
+
 def test_migration_fails_on_schema_drift_without_advancing_version(tmp_path):
     database_path = tmp_path / "pipeline.db"
     connection = sqlite3.connect(database_path)
@@ -224,6 +471,25 @@ def test_connection_enables_wal_and_foreign_keys(tmp_path):
             )
     finally:
         connection.close()
+
+
+def test_readonly_connection_requires_existing_database_and_rejects_writes(tmp_path):
+    database_path = tmp_path / "pipeline.db"
+    with pytest.raises(DatabaseError, match="does not exist"):
+        connect_db_readonly(database_path)
+
+    connection = init_db(database_path)
+    connection.close()
+    readonly = connect_db_readonly(database_path)
+    try:
+        assert readonly.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            readonly.execute(
+                "INSERT INTO pipeline_runs(run_uuid, topic, stage, config_hash) "
+                "VALUES ('run', 'topic', 'search', 'hash')"
+            )
+    finally:
+        readonly.close()
 
 
 def test_duplicate_story_can_link_to_multiple_windows(tmp_path):
@@ -387,4 +653,4 @@ def test_init_db_cli_command(tmp_path):
 
     assert result.exit_code == 0
     assert database_path.exists()
-    assert "schema version 1" in result.stdout
+    assert f"schema version {SCHEMA_VERSION}" in result.stdout

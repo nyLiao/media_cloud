@@ -8,7 +8,6 @@ order -- so the three cannot drift apart.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from types import GenericAlias
 from typing import Any
 
@@ -76,22 +75,11 @@ ARTICLE_AUDIT_COLUMNS: tuple[str, ...] = (
 )
 
 
-def _json_type(field: ExtractionField) -> str:
-    return "integer" if field.field_type == "integer" else "string"
-
-
 def _field_schema(field: ExtractionField) -> dict[str, Any]:
-    base_type = _json_type(field)
-    schema: dict[str, Any] = {
-        "type": base_type if field.required else [base_type, "null"],
+    return {
+        "type": "string" if field.required else ["string", "null"],
         "description": field.description,
     }
-    if field.field_type == "enum":
-        values: list[str | None] = list(field.values or ())
-        if not field.required:
-            values.append(None)
-        schema["enum"] = values
-    return schema
 
 
 def build_case_json_schema(extraction: ExtractionConfig) -> dict[str, Any]:
@@ -153,47 +141,24 @@ def build_response_json_schema(extraction: ExtractionConfig) -> dict[str, Any]:
 
 
 def _annotation(field: ExtractionField) -> Any:
-    """Return the Python annotation for *field*.
-
-    Enum membership is enforced by :func:`_enum_validator` rather than by a
-    ``Literal``: the values are only known at runtime, and the JSON Schema this
-    module emits already carries the ``enum`` constraint for the provider.
-    """
-    inner: Any = int if field.field_type == "integer" else str
-    return inner if field.required else inner | None
+    return str if field.required else str | None
 
 
-def _enum_validator(extraction: ExtractionConfig) -> Callable[[Any], Any]:
-    """Reject values outside a configured enum before they can reach SQLite."""
-    allowed = {
-        field.name: tuple(field.values or ())
-        for field in extraction.fields
-        if field.field_type == "enum"
-    }
+def _exactly_one_validator(extraction: ExtractionConfig) -> Any:
+    """Require nonblank required values and one configured identifier."""
 
     def validate(instance: Any) -> Any:
-        for name, values in allowed.items():
-            value = getattr(instance, name, None)
-            if value is not None and value not in values:
-                raise ValueError(f"{name} must be one of {list(values)}, got {value!r}")
-        return instance
+        for field in extraction.fields:
+            if field.required and not getattr(instance, field.name).strip():
+                raise ValueError(f"{field.name} must be provided")
 
-    return validate
-
-
-def _conditional_validator(extraction: ExtractionConfig) -> Callable[[Any], Any]:
-    """Enforce requirements that hold only for some discriminator variants."""
-    discriminator = extraction.discriminator
-    rules = {
-        variant: tuple(names) for variant, names in extraction.required_by_discriminator.items()
-    }
-
-    def validate(instance: Any) -> Any:
-        variant = getattr(instance, str(discriminator), None)
-        for name in rules.get(str(variant), ()):
-            value = getattr(instance, name, None)
-            if value is None or (isinstance(value, str) and not value.strip()):
-                raise ValueError(f"{name} is required when {discriminator} is {variant!r}")
+        populated = [
+            name
+            for name in extraction.exactly_one_of
+            if (value := getattr(instance, name)) is not None and value.strip()
+        ]
+        if len(populated) != 1:
+            raise ValueError(f"exactly one of {extraction.exactly_one_of} must be provided")
         return instance
 
     return validate
@@ -211,8 +176,7 @@ def _list_of(model: type[BaseModel]) -> Any:
 def build_case_model(extraction: ExtractionConfig) -> type[BaseModel]:
     """Return the model that validates one extracted case.
 
-    This is where ``required``, enum membership, and the conditional rules are
-    actually enforced, because a strict JSON Schema cannot express the last of them.
+    This is where nullability and the exactly-one identifier rule are enforced.
     """
     definitions: dict[str, Any] = {
         field.name: (
@@ -223,12 +187,10 @@ def build_case_model(extraction: ExtractionConfig) -> type[BaseModel]:
     }
 
     validators: dict[str, Any] = {
-        "validate_enum_membership": model_validator(mode="after")(_enum_validator(extraction))
-    }
-    if extraction.discriminator is not None:
-        validators["validate_conditional_requirements"] = model_validator(mode="after")(
-            _conditional_validator(extraction)
+        "validate_exactly_one_identifier": model_validator(mode="after")(
+            _exactly_one_validator(extraction)
         )
+    }
 
     return create_model(
         "ExtractedCase",

@@ -5,6 +5,7 @@ from mc_pipeline.errors import (
     ExtractionError,
     FetchError,
     MediaCloudError,
+    MissingCredentialError,
     PipelineError,
 )
 
@@ -12,6 +13,7 @@ from mc_pipeline.errors import (
 def test_pipeline_errors_share_one_root():
     error_types = (
         ConfigError,
+        MissingCredentialError,
         DatabaseError,
         MediaCloudError,
         FetchError,

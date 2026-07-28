@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from itertools import count
 from pathlib import Path
+from typing import Any, cast
 
 from .errors import DatabaseError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 BUSY_TIMEOUT_MS = 5000
+_SAVEPOINT_COUNTER = count()
 
 
 def connect_db(path: str | Path) -> sqlite3.Connection:
     """Open a configured SQLite connection at *path*."""
     database_path = Path(path)
-    database_path.parent.mkdir(parents=True, exist_ok=True)
+    if str(path) != ":memory:":
+        database_path.parent.mkdir(parents=True, exist_ok=True)
 
-    connection = sqlite3.connect(database_path)
+    connection = sqlite3.connect(str(path))
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA journal_mode = WAL")
@@ -25,6 +30,21 @@ def connect_db(path: str | Path) -> sqlite3.Connection:
     # WAL still serializes writers; without a busy timeout any concurrent reader
     # (an open browser, a second stage) turns a write into an immediate
     # "database is locked" error instead of a short wait.
+    connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    return connection
+
+
+def connect_db_readonly(path: str | Path) -> sqlite3.Connection:
+    """Open an existing pipeline database without permitting writes."""
+    database_path = Path(path)
+    if not database_path.is_file():
+        raise DatabaseError(f"Database does not exist: {database_path}")
+    try:
+        connection = sqlite3.connect(f"file:{database_path.resolve()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise DatabaseError(f"Failed to open database read-only: {database_path}") from exc
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
     connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return connection
 
@@ -266,7 +286,440 @@ def _migration_1(connection: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: _migration_1}
+def _migration_2(connection: sqlite3.Connection) -> None:
+    connection.execute("ALTER TABLE search_windows ADD COLUMN next_pagination_token TEXT")
+
+
+def _migration_3(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        ALTER TABLE cases ADD COLUMN private_org TEXT;
+        ALTER TABLE cases ADD COLUMN private_time TEXT;
+        ALTER TABLE cases ADD COLUMN public_org TEXT;
+        ALTER TABLE cases ADD COLUMN public_time TEXT;
+        """
+    )
+
+
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    1: _migration_1,
+    2: _migration_2,
+    3: _migration_3,
+}
+
+
+@contextmanager
+def transaction(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Run a transaction, using a savepoint when already in one."""
+    if connection.in_transaction:
+        savepoint = f"mc_pipeline_{next(_SAVEPOINT_COUNTER)}"
+        connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            yield connection
+        except BaseException:
+            connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return
+
+    connection.execute("BEGIN")
+    try:
+        yield connection
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
+def start_pipeline_run(
+    connection: sqlite3.Connection,
+    *,
+    run_uuid: str,
+    topic: str,
+    stage: str,
+    config_hash: str,
+    config_json: str,
+    git_revision: str | None,
+    package_versions_json: str,
+    raw_json: str | None = None,
+) -> int:
+    """Create a running provenance record and return its database identifier."""
+    with transaction(connection):
+        cursor = connection.execute(
+            """
+            INSERT INTO pipeline_runs(
+                run_uuid, topic, stage, config_hash, config_json, git_revision,
+                package_versions_json, raw_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_uuid,
+                topic,
+                stage,
+                config_hash,
+                config_json,
+                git_revision,
+                package_versions_json,
+                raw_json,
+            ),
+        )
+        if cursor.lastrowid is None:
+            raise DatabaseError("Failed to create pipeline run.")
+        return cursor.lastrowid
+
+
+def complete_pipeline_run(
+    connection: sqlite3.Connection,
+    run_id: int,
+    *,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """Set a pipeline run's terminal status and completion timestamp."""
+    with transaction(connection):
+        cursor = connection.execute(
+            """
+            UPDATE pipeline_runs
+            SET status = ?, error = ?, completed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (status, error, run_id),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError(f"Pipeline run {run_id} does not exist.")
+
+
+def get_search_window(
+    connection: sqlite3.Connection,
+    *,
+    topic: str,
+    request_fingerprint: str,
+    window_start: str,
+    window_end: str,
+) -> sqlite3.Row | None:
+    """Return one cached search window identified by its request scope."""
+    return cast(
+        sqlite3.Row | None,
+        connection.execute(
+            """
+        SELECT *
+        FROM search_windows
+        WHERE topic = ?
+          AND request_fingerprint = ?
+          AND window_start = ?
+          AND window_end = ?
+        """,
+            (topic, request_fingerprint, window_start, window_end),
+        ).fetchone(),
+    )
+
+
+def upsert_search_window(
+    connection: sqlite3.Connection,
+    *,
+    pipeline_run_id: int,
+    topic: str,
+    query_hash: str,
+    request_fingerprint: str,
+    query: str,
+    platform: str,
+    collection_ids_json: str,
+    source_ids_json: str,
+    languages_json: str,
+    window_start: str,
+    window_end: str,
+    mediacloud_version: str,
+) -> int:
+    """Create or attach the current run to a scoped search window."""
+    with transaction(connection):
+        connection.execute(
+            """
+            INSERT INTO search_windows(
+                pipeline_run_id, topic, query_hash, request_fingerprint, query, platform,
+                collection_ids_json, source_ids_json, languages_json, window_start, window_end,
+                mediacloud_version
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(topic, request_fingerprint, window_start, window_end)
+            DO UPDATE SET pipeline_run_id = excluded.pipeline_run_id
+            """,
+            (
+                pipeline_run_id,
+                topic,
+                query_hash,
+                request_fingerprint,
+                query,
+                platform,
+                collection_ids_json,
+                source_ids_json,
+                languages_json,
+                window_start,
+                window_end,
+                mediacloud_version,
+            ),
+        )
+        row = get_search_window(
+            connection,
+            topic=topic,
+            request_fingerprint=request_fingerprint,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        if row is None:
+            raise DatabaseError("Failed to create search window.")
+        return int(row["id"])
+
+
+def update_search_window_estimate(
+    connection: sqlite3.Connection,
+    window_id: int,
+    *,
+    relevant_count: int | None,
+    total_count: int | None,
+    raw_json: str,
+) -> None:
+    """Persist a search-count response for a window."""
+    with transaction(connection):
+        cursor = connection.execute(
+            """
+            UPDATE search_windows
+            SET relevant_count = ?, total_count = ?, raw_json = ?
+            WHERE id = ?
+            """,
+            (relevant_count, total_count, raw_json, window_id),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError(f"Search window {window_id} does not exist.")
+
+
+def persist_search_page(
+    connection: sqlite3.Connection,
+    *,
+    window_id: int,
+    page_number: int,
+    stories: Sequence[Mapping[str, Any]],
+    next_pagination_token: str | None,
+    window_raw_json: str,
+) -> None:
+    """Atomically persist one search page, its hits, and resume token."""
+    if page_number < 1:
+        raise ValueError("page_number must be at least 1.")
+
+    with transaction(connection):
+        for story in stories:
+            story_id = story["story_id"]
+            raw_json = story["raw_json"]
+            connection.execute(
+                """
+                INSERT INTO stories(
+                    story_id, title, url, url_norm, domain, publish_date, media_name,
+                    media_url, language, indexed_at, mc_text, title_norm, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(story_id) DO UPDATE SET
+                    title = COALESCE(excluded.title, stories.title),
+                    url = COALESCE(excluded.url, stories.url),
+                    url_norm = COALESCE(excluded.url_norm, stories.url_norm),
+                    domain = COALESCE(excluded.domain, stories.domain),
+                    publish_date = COALESCE(excluded.publish_date, stories.publish_date),
+                    media_name = COALESCE(excluded.media_name, stories.media_name),
+                    media_url = COALESCE(excluded.media_url, stories.media_url),
+                    language = COALESCE(excluded.language, stories.language),
+                    indexed_at = COALESCE(excluded.indexed_at, stories.indexed_at),
+                    mc_text = COALESCE(excluded.mc_text, stories.mc_text),
+                    title_norm = COALESCE(excluded.title_norm, stories.title_norm),
+                    raw_json = excluded.raw_json,
+                    last_seen_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    story_id,
+                    story.get("title"),
+                    story.get("url"),
+                    story.get("url_norm"),
+                    story.get("domain"),
+                    story.get("publish_date"),
+                    story.get("media_name"),
+                    story.get("media_url"),
+                    story.get("language"),
+                    story.get("indexed_at"),
+                    story.get("mc_text"),
+                    story.get("title_norm"),
+                    raw_json,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO search_hits(
+                    search_window_id, story_id, page_number, result_rank, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(search_window_id, story_id) DO UPDATE SET
+                    page_number = excluded.page_number,
+                    result_rank = excluded.result_rank,
+                    raw_json = excluded.raw_json,
+                    found_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    window_id,
+                    story_id,
+                    page_number,
+                    story.get("result_rank"),
+                    raw_json,
+                ),
+            )
+
+        cursor = connection.execute(
+            """
+            UPDATE search_windows
+            SET pages_fetched = MAX(pages_fetched, ?),
+                next_pagination_token = ?,
+                raw_json = ?,
+                status = 'running',
+                pagination_completed = 0,
+                completed_at = NULL,
+                error = NULL
+            WHERE id = ?
+            """,
+            (page_number, next_pagination_token, window_raw_json, window_id),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError(f"Search window {window_id} does not exist.")
+
+
+def mark_search_window_complete(
+    connection: sqlite3.Connection,
+    window_id: int,
+    *,
+    raw_json: str,
+) -> None:
+    """Mark a window complete only after its pagination token is exhausted."""
+    with transaction(connection):
+        cursor = connection.execute(
+            """
+            UPDATE search_windows
+            SET status = 'completed',
+                pagination_completed = 1,
+                next_pagination_token = NULL,
+                raw_json = ?,
+                completed_at = CURRENT_TIMESTAMP,
+                error = NULL
+            WHERE id = ?
+            """,
+            (raw_json, window_id),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError(f"Search window {window_id} does not exist.")
+
+
+def mark_search_window_failed(
+    connection: sqlite3.Connection,
+    window_id: int,
+    *,
+    status: str,
+    error: str,
+    raw_json: str,
+) -> None:
+    """Record a failed or page-limited window without discarding its resume token."""
+    with transaction(connection):
+        cursor = connection.execute(
+            """
+            UPDATE search_windows
+            SET status = ?, raw_json = ?, error = ?, completed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (status, raw_json, error, window_id),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError(f"Search window {window_id} does not exist.")
+
+
+def search_review_rows(connection: sqlite3.Connection, topic: str) -> list[sqlite3.Row]:
+    """Return deterministic, per-hit search rows for review."""
+    return connection.execute(
+        """
+        SELECT
+            search_windows.id AS search_window_id,
+            search_windows.topic,
+            search_windows.window_start,
+            search_windows.window_end,
+            search_windows.status AS window_status,
+            search_windows.pagination_completed,
+            search_hits.page_number,
+            search_hits.result_rank,
+            search_hits.raw_json AS hit_raw_json,
+            stories.story_id,
+            stories.title,
+            stories.url,
+            stories.url_norm,
+            stories.domain,
+            stories.publish_date,
+            stories.media_name,
+            stories.media_url,
+            stories.language,
+            stories.indexed_at,
+            stories.mc_text,
+            stories.title_norm,
+            stories.raw_json,
+            stories.first_seen_at,
+            stories.last_seen_at
+        FROM search_hits
+        JOIN search_windows ON search_windows.id = search_hits.search_window_id
+        JOIN stories ON stories.story_id = search_hits.story_id
+        WHERE search_windows.topic = ?
+        ORDER BY
+            search_windows.window_start ASC,
+            search_windows.window_end ASC,
+            search_hits.page_number ASC,
+            search_hits.result_rank ASC,
+            stories.story_id ASC
+        """,
+        (topic,),
+    ).fetchall()
+
+
+def search_review_stats(connection: sqlite3.Connection, topic: str) -> Mapping[str, int]:
+    """Return deterministic aggregate counts for a topic's search cache."""
+    row = connection.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM search_windows WHERE topic = ?) AS window_count,
+            (
+                SELECT COUNT(*) FROM search_windows
+                WHERE topic = ? AND status = 'completed'
+            ) AS completed_window_count,
+            (
+                SELECT COUNT(*) FROM search_windows
+                WHERE topic = ? AND status = 'failed'
+            ) AS failed_window_count,
+            (
+                SELECT COUNT(*) FROM search_windows
+                WHERE topic = ? AND status = 'page_limit'
+            ) AS page_limit_window_count,
+            (
+                SELECT COALESCE(SUM(pages_fetched), 0) FROM search_windows WHERE topic = ?
+            ) AS pages_fetched,
+            (
+                SELECT COUNT(*)
+                FROM search_hits
+                JOIN search_windows ON search_windows.id = search_hits.search_window_id
+                WHERE search_windows.topic = ?
+            ) AS hit_count,
+            (
+                SELECT COUNT(DISTINCT search_hits.story_id)
+                FROM search_hits
+                JOIN search_windows ON search_windows.id = search_hits.search_window_id
+                WHERE search_windows.topic = ?
+            ) AS story_count
+        """,
+        (topic, topic, topic, topic, topic, topic, topic),
+    ).fetchone()
+    if row is None:
+        raise DatabaseError("Failed to query search review statistics.")
+    return dict(zip(row.keys(), (int(value) for value in row), strict=True))
 
 
 def init_db(path: str | Path) -> sqlite3.Connection:

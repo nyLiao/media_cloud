@@ -1,27 +1,28 @@
 media_cloud:
   api_key_env: MC_API_TOKEN
   platform: onlinenews-mediacloud
-  window_days: 30
+  window_days: 5000
   # mediacloud 5.1.0 supports page_size; the server-side maximum is not yet documented.
   page_size: 1000
   max_pages_per_window: 50
   timeout_s: 300
+  max_retries: 0
 
 fetch:
   user_agent: "media-cloud-research/0.1 (+mailto:you@example.org)"
   per_domain_delay_s: 3.0
   global_max_rps: 2.0
   timeout_s: 30
-  max_retries: 4
+  max_retries: 0
   respect_robots: true
-  wayback_fallback: true
+  wayback_fallback: false
   min_text_chars: 500
   save_raw_html: true
 
 llm:
   base_url_env: LLM_BASE_URL
   api_key_env: LLM_API_KEY
-  model: ""
+  model: "glm-5"
   timeout_s: 300
   max_requests_per_min: 30
   articles_per_request: 5
@@ -54,22 +55,10 @@ topics:
     extraction:
       unit: person_transition
       relevance_criteria: >-
-        The article must describe a specific named individual moving between a
-        government/public-sector role and a private-sector/lobbying role (in either
-        direction). General commentary about revolving doors with no named person
-        is NOT relevant.
-      # `required` below means "never null". Requirements that hold for only some
-      # case types belong here, because a strict JSON Schema cannot express them.
-      discriminator: case_type
-      required_by_discriminator:
-        individual: [person_name, previous_org, current_org]
-        cohort: [cohort_name]
+        The article must explicitly report a high-confidence transition between a
+        public-sector organization and a private organization.
+      exactly_one_of: [person_name, cohort_name]
       fields:
-        - name: case_type
-          type: enum
-          required: true
-          values: [individual, cohort]
-          description: "Whether this finding concerns a named person or a group-level pattern."
         - name: person_name
           type: string
           required: false
@@ -77,70 +66,24 @@ topics:
         - name: cohort_name
           type: string
           required: false
-          description: "Short descriptive name for a cohort finding."
-        - name: cohort_size
-          type: integer
-          required: false
-          description: "Number of people in the cohort when explicitly reported."
-        - name: cohort_period
+          description: "Short descriptive name for a cohort finding; null for individuals."
+        - name: private_org
+          type: string
+          required: true
+          description: "Private organization explicitly involved in the transition."
+        - name: private_time
           type: string
           required: false
-          description: "Period the cohort finding covers, such as 2019-2023."
-        - name: previous_org
+          description: "Explicit time associated with the private role; null if unstated."
+        - name: public_org
+          type: string
+          required: true
+          description: "Public-sector organization explicitly involved in the transition."
+        - name: public_time
           type: string
           required: false
-          description: "Organization they left; null for cohort findings without one."
-        - name: previous_role
-          type: string
-          required: false
-          description: "Job title at the previous organization."
-        - name: previous_sector
-          type: string
-          required: false
-          description: "Sector of the previous organization, such as public or private."
-        - name: previous_year
-          type: integer
-          required: false
-          description: "Year they left, 4-digit. null if not stated."
-        - name: current_org
-          type: string
-          required: false
-          description: "Organization they joined; null for cohort findings without one."
-        - name: current_role
-          type: string
-          required: false
-          description: "Job title at the new organization."
-        - name: current_sector
-          type: string
-          required: false
-          description: "Sector of the current organization, such as public or private."
-        - name: current_year
-          type: integer
-          required: false
-          description: "Year they joined, 4-digit. null if not stated."
-        - name: direction
-          type: enum
-          required: false
-          values: [public_to_private, private_to_public, unclear]
-          description: "Direction of the move."
+          description: "Explicit time associated with the public role; null if unstated."
         - name: jurisdiction
           type: string
-          required: false
-          description: "Relevant Canadian jurisdiction, such as federal or British Columbia."
-        - name: expected_resolvable
-          type: enum
           required: true
-          values: ["yes", partial, "no"]
-          description: "Whether the article contains enough detail to resolve the transition."
-        - name: status
-          type: string
-          required: true
-          description: "Reported status of the case, such as reported or under review."
-        - name: claim
-          type: string
-          required: true
-          description: "Concise human-readable summary of the revolving-door finding."
-        - name: evidence_quote
-          type: string
-          required: true
-          description: "Verbatim sentence from the article supporting this row. Must appear in the text."
+          description: "Jurisdiction explicitly associated with the transition."

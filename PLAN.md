@@ -2,8 +2,8 @@
 
 > **Agent quick start**
 >
-> - **Status:** foundation implemented (config, DB schema v1, `identity`, `contracts`, CLI `init-db`, probe). Stages 1–5 pending.
-> - **Next action:** implement Stage 1 (Search).
+> - **Status:** foundation and Stage 1 Search implemented. Stages 2–5 pending.
+> - **Next action:** review the Stage 1 CSV, then implement Stage 2 Dedup/QC.
 > - **Read before editing:** §0 (how to use this doc), §3 (invariants), §5 (data model), then the one stage section you are implementing.
 > - **Do not** run a full-range search, crawl, or LLM pass without explicit user approval.
 >
@@ -59,13 +59,13 @@ that satisfies the higher-priority source.
 |---|---|---|
 | uv, Python 3.12, lockfile | done | `pyproject.toml`, `uv.lock`, `.python-version` |
 | Secret-safe config loading | done | `src/mc_pipeline/config.py` |
-| SQLite schema v1 + `init-db` | done (C1–C3, C8 applied) | `src/mc_pipeline/db.py` |
+| SQLite schema v3 + `init-db` | done (resumable search + simplified case fields) | `src/mc_pipeline/db.py` |
 | Canonical hashing, fingerprints, case IDs | done (C4, C7) | `src/mc_pipeline/identity.py` |
 | Config → JSON Schema / model / CSV columns | done (C5, C6) | `src/mc_pipeline/contracts.py` |
 | Media Cloud probe | done | `scripts/probe_api.py` |
 | `errors.py` (typed taxonomy) | done (C9) | `src/mc_pipeline/errors.py` |
 | `ratelimit.py` | done | `src/mc_pipeline/ratelimit.py` |
-| Stage 1 Search | pending | §6.1 |
+| Stage 1 Search | done | `src/mc_pipeline/search.py`, §6.1 |
 | Stage 2 Dedup/QC | pending | §6.2 |
 | Stage 3 Fetch | pending | §6.3 |
 | Stage 4 Extract | pending | §6.4 |
@@ -128,9 +128,9 @@ Two design points worth keeping in mind, both now enforced by tests:
 ### Migration waiver — expired
 
 **R-DB-1** normally forbids editing a released migration. It was waived once for C1–C3, after
-confirming no `data/mc.db` existed; `_migration_1` was amended in place and `SCHEMA_VERSION`
-stays `1`. **That waiver is now spent.** All further schema changes are additive: add
-`_migration_2` and bump `SCHEMA_VERSION`.
+confirming no `data/mc.db` existed; `_migration_1` was amended in place. **That waiver is now
+spent.** All later changes are additive; `_migration_2` added search resume state and
+`_migration_3` added the simplified public/private case fields.
 
 Anyone holding a database created before 2026-07-27 must delete and re-run `init-db`; it
 predates the C1–C3 columns and no upgrade path exists.
@@ -142,14 +142,15 @@ predates the C1–C3 columns and no upgrade path exists.
 
 These outrank convenience, elegance, and throughput.
 
-- **INV-1 Quota safety.** A completed search window is never re-queried for the same semantic
-  fingerprint.
-- **INV-2 Provenance.** Raw API payloads, query parameters, package versions, prompt/schema
-  hashes, fetch attempts, and case evidence stay auditable.
+- **INV-1 Minimum external cost.** Default to one full-range Media Cloud partition, skip the
+  estimate call unless explicitly requested, never retry an external request automatically,
+  and never re-query a completed semantic fingerprint.
+- **INV-2 Minimal provenance.** Keep enough request parameters, hashes, terminal statuses, and
+  evidence to reproduce accepted results; do not retain extra payloads solely for completeness.
 - **INV-3 Idempotence.** Every stage resumes incomplete work and is safe to rerun.
-- **INV-4 No silent loss.** Duplicates, QC rejects, fetch failures, irrelevant articles, and
-  invalid extractions stay represented in the database. Never delete a record to make a rerun
-  succeed or to improve reported coverage.
+- **INV-4 Precision-first output.** Low-confidence or ambiguous findings do not become case
+  rows. Search/fetch terminal status remains available for quota control, but the final dataset
+  intentionally favors a small reliable set over exhaustive coverage.
 - **INV-5 Secret safety.** Credentials stay in ignored `config/.env` and never reach logs, Git,
   SQLite, exports, or test fixtures.
 
@@ -170,6 +171,9 @@ source URLs: `docs/api-notes.md`.
 - The `Story` TypedDict permits optional `text`, but `expanded=True` returns **HTTP 403** for
   this account. Full-text acquisition (Stage 3) is therefore required, and Stage 3 must still
   honour `mc_text` if a future response supplies it.
+- The interrupted 2021–2025 run stored 5,564 stories and **zero** `mc_text` values. A bounded
+  eight-URL check returned six HTTP 200 responses, one 403, and one 404, so direct page fetching
+  is applicable for many records but must skip blocked or missing pages without retry loops.
 - Search is not title-only: live results matched without query terms in their titles.
 - `LLM_BASE_URL` already ends in `/v1` and must be passed unchanged.
 
@@ -208,8 +212,8 @@ Anything computed from `TopicConfig` is topic-scoped. This is the rule C1 and C2
 - **`story_topic_state`** — *(new, C1)* per-topic QC and dedup decisions.
 - **`articles`** — current terminal fetch/extraction state per story: selected source, final
   URL, text, metadata, raw HTML path, error.
-- **`fetch_attempts`** — append-only: request URL, source, retry number, HTTP status, elapsed
-  time, `Retry-After`, extractor, text length, error, raw metadata.
+- **`fetch_attempts`** — append-only single-attempt records: request URL, source, HTTP status,
+  elapsed time, extractor, text length, error, raw metadata.
 - **`extraction_batches`** — model/base-URL identifier, prompt/schema hashes, prompt version,
   story IDs, attempt count, request/response/usage JSON, status, timestamps.
 - **`story_extractions`** — one relevance decision per (topic, story, prompt version), plus
@@ -301,13 +305,14 @@ public interface.
 | `errors.py` | `PipelineError` hierarchy | anything else |
 | `identity.py` | canonical JSON, SHA-256 hashes, window fingerprints, case IDs | config parsing, I/O |
 | `contracts.py` | config → JSON Schema, validation model, CSV columns | provider calls, DB writes |
+| `prompt.py` | minimal deterministic extraction instructions | provider calls, DB writes |
 | `db.py` | connections, migrations, transactions, repositories | stage orchestration |
-| `ratelimit.py` | clocks, token bucket, per-domain delay, `Retry-After` parsing | HTTP clients |
+| `ratelimit.py` | clocks, token bucket, per-domain delay | HTTP clients |
 | `search.py` | **all** `mediacloud` imports/calls, windowing, cache writes | article HTTP |
 | `dedup.py` | deterministic normalization, duplicate and QC decisions | network calls |
-| `fetch.py` | robots, live HTTP, Wayback, HTML storage, text extraction | Media Cloud search |
+| `fetch.py` | robots, one live HTTP attempt, HTML storage, text extraction | Media Cloud search |
 | `llm.py` | OpenAI-compatible client, capability detection, paced requests | prompt assembly |
-| `extract.py` | schema/prompt building, packing, validation, case persistence | HTTP client setup |
+| `extract.py` | packing, validation, case persistence | HTTP client setup, prompt wording |
 | `export.py` | deterministic CSV queries/writes, reconciliation | extraction decisions |
 | `cli.py` | argument parsing, stage invocation, user-facing summaries | stage business logic |
 
@@ -336,8 +341,10 @@ def search_topic(
 
 - **S1-R1** Validate collection/source scope **before** constructing `SearchApi` (verified 422).
 - **S1-R2** Default study collection is `34411583`; never substitute another silently.
-- **S1-R3** Split the range into closed, non-overlapping windows of `window_days`.
-- **S1-R4** `estimate` calls `story_count` only, never `story_list`.
+- **S1-R3** Use one closed full-study partition by default. Smaller date partitions are an
+  explicit recovery tool only when the provider cannot complete the full-range request.
+- **S1-R4** `estimate` is optional and calls `story_count` only. Production search scripts skip
+  it because it spends quota without retrieving story IDs.
 - **S1-R5** Skip windows whose fingerprint is already complete (**INV-1**).
 - **S1-R6** Use `identity.window_fingerprint()`. It covers query, platform, collection IDs,
   source IDs, languages, window bounds, and contract version — and deliberately has no
@@ -346,19 +353,18 @@ def search_topic(
   known 403.
 - **S1-R8** Persist each page before requesting the next; mark the window complete only after
   the token is exhausted. Never mark complete after a partial page failure.
-- **S1-R9** On reaching `max_pages_per_window`, persist the window incomplete and return an
-  infrastructure failure for operator review.
-- **S1-R10** Retry only 429, connection failures, and bounded 5xx. Honour `Retry-After`;
-  otherwise exponential backoff with jitter and a maximum delay.
+- **S1-R9** On reaching `max_pages_per_window`, persist the partition incomplete and stop it.
+- **S1-R10** Make one provider attempt per count or page. On any failure, persist the partition
+  as failed, skip it, and continue; the operator decides whether a later rerun is worth quota.
 - **S1-R11** Pagination tokens are opaque transient progress — never a cache key.
 
 **Done when:** missing scope fails before any API call · the eight-key payload round-trips
 through `raw_json` · one story can belong to multiple windows · a completed window produces
 **zero** API calls on rerun · incomplete pagination is never marked complete.
 
-**Live progression (do not skip):** directory lookup or `estimate` → one short-window search
-with an explicit window limit → second invocation proving zero API calls → expand only after
-reconciliation **and** user approval.
+**Long run:** the agent does not execute or monitor full searches. The user runs
+`scripts/run_media_cloud_search.sh`; it skips `estimate`, logs locally, and relies on completed
+fingerprints and pagination checkpoints.
 
 ---
 
@@ -386,8 +392,8 @@ Pure function of the database — no network, no credentials, free to rerun afte
 - **S2-R5** Canonical row for a title-duplicate group is the **earliest** `publish_date`.
 - **S2-R6** Apply language, date-range, URL-pattern, title-length, and optional domain rules.
   An empty `domain_allowlist` means no extra domain filter — the collection already scopes sources.
-- **S2-R7** Never delete a rejected story (**INV-4**). Only `qc_status='ok' AND
-  dup_of_story_id IS NULL` proceeds to Stage 3.
+- **S2-R7** Only deterministic, high-confidence `qc_status='ok'` rows proceed. Rejected metadata
+  may remain in the cache for quota safety but is excluded from all downstream work.
 
 **Done when:** deterministic on fixtures · idempotent on rerun · two topics can hold different
 `qc_status` for the same story (the C1 regression test).
@@ -403,7 +409,6 @@ def fetch_topic(
     connection: sqlite3.Connection,
     *,
     limit: int | None = None,
-    retry_failed: bool = False,
     dry_run: bool = False,
 ) -> StageSummary: ...
 ```
@@ -414,31 +419,27 @@ Order of acquisition:
 
 1. Use `stories.mc_text` when a future response supplies it and it meets `min_text_chars`
    (`source='mediacloud'`) — no HTTP.
-2. Live URL with robots check, global and per-domain limits, bounded retries, research user agent.
+2. Live URL once, with robots check, global/per-domain limits, and research user agent.
 3. Extract from **pre-fetched** HTML: `trafilatura` → `readability-lxml` → BeautifulSoup
    paragraph fallback. First result ≥ `min_text_chars` wins; record which extractor succeeded.
-4. On block, failure, or short text: Wayback availability
-   (`https://archive.org/wayback/available?url=…&timestamp=YYYYMMDD`) then the original-byte
-   replay `https://web.archive.org/web/<timestamp>id_/<url>`; re-run the extractor chain.
-5. Record a terminal state always: `ok` | `fetch_failed` | `too_short` | `skipped`.
+4. On block, failure, or short text, record a terminal state and skip. Wayback is disabled by
+   default because it adds requests and failure modes.
 
 - **S3-R1** Extractors never fetch URLs; the pipeline owns every request.
 - **S3-R2** Check cached robots rules before a domain's first request.
-- **S3-R3** Apply global and per-domain limits before every live *and* Wayback request; Wayback
-  gets its own throttle entry.
+- **S3-R3** Apply global and per-domain limits before each live request.
 - **S3-R4** Configure a real contact address in `user_agent` before production crawling.
-- **S3-R5** Retry safe methods only. Cap redirects, response bytes, retry count, total time.
+- **S3-R5** Do not retry. Cap redirects, response bytes, and total request time.
 - **S3-R6** Accept HTML-like content types only; record anything else.
 - **S3-R7** Save raw HTML atomically (temp file then rename); derive paths from safe
   topic/story identifiers, never from untrusted URL path strings.
 - **S3-R8** Re-extraction from stored HTML must make **no** network calls.
-- **S3-R9** Wayback is a fallback for failure, not a means to bypass access controls. **Do not
-  implement paywall bypass.**
+- **S3-R9** Do not use Wayback or paywall bypasses in the default pipeline.
 - **S3-R10** `too_short` stays distinct from transport `fetch_failed`.
 
-**Done when:** mocked success, retry, permanent failure, and Wayback-fallback paths are all
-covered · one domain's delay is observably respected under a fake clock · a rerun re-attempts
-only `fetch_failed` rows.
+**Done when:** mocked success and single-attempt failure paths are covered · one domain's delay
+is observably respected under a fake clock · failed rows remain skipped unless the user starts
+an explicit new run.
 
 ---
 
@@ -463,7 +464,7 @@ def extract_topic(
 - **S4-R2** Build the schema with `contracts.build_response_json_schema()` and the prompt
   deterministically from topic config; hash the exact system prompt, user-template version,
   and schema.
-- **S4-R3** Client with `max_retries=0` — pipeline pacing and retry are authoritative.
+- **S4-R3** Client and pipeline both use `max_retries=0`; a failed request is recorded and skipped.
 - **S4-R4** Serial requests, ≤ 30 per minute, via the shared token bucket.
 - **S4-R5** Pack `articles_per_request` (default 5) labelled articles; delimit each with an
   immutable story ID; validate returned IDs against the batch.
@@ -473,24 +474,22 @@ def extract_topic(
   unrelated 400s.
 - **S4-R8** Validate every response with `contracts.build_response_model()` even when the
   provider claims strict conformance.
-- **S4-R9** Config `required` drives **Pydantic**, not the schema `required` array (C6).
-  Conditional rules come from `extraction.discriminator` and
-  `extraction.required_by_discriminator` — never hardcode `case_type` semantics in Python.
+- **S4-R9** The only extracted fields are `person_name`, `cohort_name`, `private_org`,
+  `private_time`, `public_org`, `public_time`, and `jurisdiction`. Exactly one of person/cohort
+  name is present. Organization fields and jurisdiction are required; times may be null.
 - **S4-R10** Generate `case_id` with `identity.build_case_id()` (C4); never from the model.
-- **S4-R11** Invalid or unparsable output ⇒ `story_extractions.validation_status` set,
-  payload retained, **zero** `cases` rows. Never let an `IntegrityError` abort a batch (C3).
-- **S4-R12** Normalize whitespace for evidence matching only; store the original quote.
-  Unverified evidence is flagged explicitly, not dropped.
-- **S4-R13** On missing story IDs, requeue only the missing items. On context overflow, split
-  the batch deterministically — do not truncate harder.
+- **S4-R11** Invalid, ambiguous, or low-confidence output produces **zero** case rows and is not
+  requeued. The prompt explicitly says to omit uncertain findings rather than infer values.
+- **S4-R12** Do not request evidence quotes or confidence scores; source text and story ID remain
+  the audit link for accepted rows.
+- **S4-R13** Missing story IDs or context overflow are skipped for that batch, without retries.
 - **S4-R14** Record provider request IDs and usage; never headers or secrets.
 - **S4-R15** Unknown proxy model names fall back to `tiktoken.get_encoding("o200k_base")` for
   token estimates.
 
-**Done when:** `GC008`-shaped individual and `GC011`-shaped cohort records both validate · one
-article can produce multiple cases · an irrelevant article is persisted with a reason · a
-schema-violating response is persisted as `invalid` without aborting the batch · evidence
-verification status is explicit.
+**Done when:** one high-confidence individual and one high-confidence cohort validate with only
+the seven configured fields · ambiguous articles yield no case rows · one provider failure does
+not trigger another request.
 
 ---
 
@@ -589,7 +588,7 @@ PipelineError
 Classification:
 
 - `permanent_record` — invalid URL, robots denial, unsupported content, irrelevant article
-- `retryable_record` — transient HTTP/Wayback/provider failure below the retry limit
+- `skipped_record` — any failed external record request after its single allowed attempt
 - `infrastructure` — authentication, schema/migration failure, repeated provider outage,
   filesystem failure, invalid capability negotiation
 
@@ -638,7 +637,7 @@ $UV run ruff format . && $UV run ruff check . && $UV run mypy src
 
 - `TokenBucket(rate_per_min)` — shared by the global fetch cap and the LLM's 30 rpm.
 - `PerDomainThrottle(delay_s)` — `domain → last_request_monotonic`; sleeps the remainder.
-- `parse_retry_after(header)` — handles both integer-seconds and HTTP-date forms.
+- `parse_retry_after(header)` remains a parsing utility but is not used to trigger retries.
 - `time.monotonic()` throughout; the clock and sleeper are injectable (**R-CODE-5**).
 
 ### 7.8 Testing (R-TEST)
@@ -671,11 +670,11 @@ $UV run mypy src
 |---|---|---|
 | **Offline** | `uv sync`, `init-db` on a temp path, `pytest` | none |
 | **Diagnostic probe** | `scripts/probe_api.py`, one operation per invocation, `page_size ≤ 10`, bounded metadata only | none |
-| **Smoke** | explicit topic, one short window, fetch `--limit ≤ 20`, extract `--limit ≤ 10` | offline gate passes |
-| **Full** | complete study range | smoke passed, cache reuse verified, fetch-domain review done, manual accuracy review done, **user approval** |
+| **Smoke** | dry-run plus local fixtures; optional one-request diagnostic | offline gate passes |
+| **Long** | real Media Cloud search or LLM extraction | user launches a script locally; agent does not monitor |
 
-A full run must write a `pipeline_runs` record with config hash, Git revision, dependency
-versions, and timestamps.
+A long run writes provenance and logs locally, but must be launched with
+`scripts/run_media_cloud_search.sh` or `scripts/run_llm_analysis.sh` by the user.
 
 ### 7.10 Provenance (R-PROV)
 
@@ -702,7 +701,7 @@ mc-pipeline resolve-sources --name Canada
 mc-pipeline estimate        --topic revolving_door_ca
 mc-pipeline search          --topic revolving_door_ca [--limit-windows N]
 mc-pipeline dedup           --topic revolving_door_ca
-mc-pipeline fetch           --topic revolving_door_ca [--limit N] [--retry-failed]
+mc-pipeline fetch           --topic revolving_door_ca [--limit N]
 mc-pipeline extract         --topic revolving_door_ca [--limit N] [--articles-per-request K]
 mc-pipeline export          --topic revolving_door_ca
 mc-pipeline status          --topic revolving_door_ca
@@ -722,7 +721,7 @@ guarantee no quota, paid, or network mutation.
 | `estimate` | `story_count` | `story_list` |
 | `search` | Media Cloud | article URLs |
 | `dedup` | database | network, credentials |
-| `fetch` | article + Wayback HTTP | LLM |
+| `fetch` | one live article request | Wayback, LLM |
 | `extract` | LLM over stored text | article URLs |
 | `export` | database, filesystem | network, credentials |
 | `status` | database (read-only) | everything else |
@@ -763,11 +762,12 @@ network call.
 - full-range Media Cloud search without explicit approval
 - crawl without configured identification, robots handling, and limits
 - bypass paywalls or access controls
-- retry permanent 4xx other than handled 408/409/425/429 semantics
+- automatically retry any external request
 - call expanded Media Cloud stories after the verified 403, absent a documented capability change
 - send articles to the LLM before validating fetch status and text length
 - overwrite completed cache records without a changed fingerprint or contract version
-- delete failed or rejected records to improve reported coverage
+- turn low-confidence or ambiguous extraction output into case rows
+- have an agent launch or monitor long-running Media Cloud or LLM jobs
 - change CSV columns silently
 - mutate released migrations (waiver in §2 only)
 - real network calls in unit tests
@@ -775,9 +775,8 @@ network call.
 
 ### 8.5 Accuracy gate before scale
 
-Hand-label ~20 articles; compare precision/recall for person, organizations, direction, case
-relevance, and cohort handling. Tune query, `relevance_criteria`, and packing size **before**
-running the full 2021–2025 range.
+Hand-label a small sample and optimize precision first. Accept lower recall rather than adding
+queries, retries, fallback crawlers, or inferred low-confidence records.
 
 ---
 
@@ -812,7 +811,7 @@ therefore unverified.
 - public service signature (§6) and CLI command implemented
 - terminal states and idempotent rerun behaviour defined
 - writes preserve raw and normalized provenance
-- unit and adapter tests cover success, retry, permanent failure, and resume
+- unit and adapter tests cover success, single-attempt failure, skip, and resume
 - §7.8 gate passes
 - bounded smoke validation passes when the stage uses an external service
 - README, this plan, and `docs/api-notes.md` match actual behaviour

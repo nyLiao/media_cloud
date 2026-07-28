@@ -12,7 +12,7 @@ import yaml
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 
-from .errors import ConfigError
+from .errors import ConfigError, MissingCredentialError
 
 MIN_QUERY_TIMEOUT_S = 300.0
 
@@ -28,6 +28,7 @@ class MediaCloudConfig(StrictModel):
     page_size: int = Field(gt=0)
     max_pages_per_window: int = Field(gt=0)
     timeout_s: float = Field(ge=MIN_QUERY_TIMEOUT_S)
+    max_retries: int = Field(ge=0)
 
 
 class FetchConfig(StrictModel):
@@ -64,26 +65,16 @@ class QCConfig(StrictModel):
 
 class ExtractionField(StrictModel):
     name: str
-    field_type: Literal["string", "integer", "enum"] = Field(alias="type")
+    field_type: Literal["string"] = Field(alias="type")
     required: bool
     description: str
-    values: list[str] | None = None
-
-    @model_validator(mode="after")
-    def validate_enum_values(self) -> ExtractionField:
-        if self.field_type == "enum" and not self.values:
-            raise ValueError("enum extraction fields require values")
-        if self.field_type != "enum" and self.values is not None:
-            raise ValueError("only enum extraction fields may define values")
-        return self
 
 
 class ExtractionConfig(StrictModel):
     unit: str
     relevance_criteria: str
     fields: list[ExtractionField]
-    discriminator: str | None = None
-    required_by_discriminator: dict[str, list[str]] = Field(default_factory=dict)
+    exactly_one_of: list[str] = Field(min_length=2)
 
     @model_validator(mode="after")
     def validate_field_names(self) -> ExtractionConfig:
@@ -94,42 +85,28 @@ class ExtractionConfig(StrictModel):
         return self
 
     @model_validator(mode="after")
-    def validate_conditional_requirements(self) -> ExtractionConfig:
-        """Check the conditional-requirement rules against the declared fields.
-
-        ``required`` on a field means "never null". Requirements that hold only for
-        some variants (a cohort finding has no person name) belong here instead,
-        because a strict JSON Schema cannot express them.
-        """
+    def validate_transition_contract(self) -> ExtractionConfig:
+        """Enforce the fixed, minimal transition-extraction contract."""
         by_name = {field.name: field for field in self.fields}
+        expected_names = {
+            "person_name",
+            "cohort_name",
+            "private_org",
+            "private_time",
+            "public_org",
+            "public_time",
+            "jurisdiction",
+        }
+        if set(by_name) != expected_names:
+            raise ValueError(f"extraction.fields must be exactly: {sorted(expected_names)}")
+        if self.exactly_one_of != ["person_name", "cohort_name"]:
+            raise ValueError('exactly_one_of must be ["person_name", "cohort_name"]')
+        if any(by_name[name].required for name in self.exactly_one_of):
+            raise ValueError("exactly_one_of fields must allow null")
 
-        if self.discriminator is None:
-            if self.required_by_discriminator:
-                raise ValueError("required_by_discriminator needs a discriminator field")
-            return self
-
-        discriminator_field = by_name.get(self.discriminator)
-        if discriminator_field is None:
-            raise ValueError(f"discriminator {self.discriminator!r} is not a declared field")
-        if discriminator_field.field_type != "enum":
-            raise ValueError(f"discriminator {self.discriminator!r} must be an enum field")
-        if not discriminator_field.required:
-            raise ValueError(f"discriminator {self.discriminator!r} must be required")
-
-        allowed_variants = set(discriminator_field.values or ())
-        for variant, required_names in self.required_by_discriminator.items():
-            if variant not in allowed_variants:
-                raise ValueError(
-                    f"required_by_discriminator variant {variant!r} is not a value of "
-                    f"{self.discriminator!r}: expected one of {sorted(allowed_variants)}"
-                )
-            for name in required_names:
-                if name not in by_name:
-                    raise ValueError(
-                        f"required_by_discriminator[{variant!r}] names unknown field {name!r}"
-                    )
-                if name == self.discriminator:
-                    raise ValueError("the discriminator cannot require itself")
+        required_names = {"private_org", "public_org", "jurisdiction"}
+        if {name for name, field in by_name.items() if field.required} != required_names:
+            raise ValueError("only private_org, public_org, and jurisdiction may be required")
         return self
 
 
@@ -180,7 +157,7 @@ def load_config(path: str | Path = "config/topics.yaml") -> AppConfig:
 def _load_required_env(name: str, file_values: Mapping[str, str | None]) -> SecretStr:
     value = os.environ.get(name) or file_values.get(name)
     if not value:
-        raise ConfigError(f"Missing required environment variable: {name}")
+        raise MissingCredentialError(f"Missing required environment variable: {name}")
     return SecretStr(value)
 
 

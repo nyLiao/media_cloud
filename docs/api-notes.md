@@ -97,7 +97,22 @@ full-text capability implied by the package model. However:
 - `expanded=True` returned HTTP 403: the account is not permitted to fetch expanded stories
 
 Therefore the pipeline must preserve optional `text` if a future response supplies it, but
-must implement live-page extraction and Wayback fallback for the current account.
+must use direct live-page extraction for the current account and skip failures by default.
+
+### 2026-07-27 quota and text audit
+
+The first production attempt demonstrated that fixed 30-day windows were too expensive for
+this study. Sixty-one count calls were made before search, then 47 result-page calls completed
+through `2024-11-10`. The database contains 5,564 distinct metadata stories and zero populated
+`mc_text` values. Windowing is a pipeline recovery choice, not a Media Cloud API requirement.
+
+The default is now one full-range partition with `page_size=1000`, no estimate prerequisite,
+and no automatic retries. Smaller date partitions are reserved for explicit recovery only.
+
+A bounded availability check of eight stored URLs returned six HTTP 200 responses, one 403,
+and one 404. Direct article-page fetching is therefore applicable to many current records, but
+blocked or missing pages should be skipped after one attempt. Media Cloud expanded text remains
+unavailable for this account.
 
 ### Counts and pagination
 
@@ -137,7 +152,7 @@ Sources:
 - https://trafilatura.readthedocs.io/en/latest/corefunctions.html
 - https://pypi.org/project/readability-lxml/
 
-### Wayback
+### Wayback reference — disabled by default
 
 `CONFIRMED`
 
@@ -147,20 +162,19 @@ Sources:
 - Original-byte replay:
   `https://web.archive.org/web/<timestamp>id_/<url>`
 
-Use Wayback after blocked/failed live requests or extracted text below the configured
-minimum. Do not implement paywall bypasses.
+The endpoints were verified for reference, but the pipeline does not call Wayback by default.
+Blocked, missing, or short pages are skipped after the single live request. Do not implement
+paywall bypasses.
 
 Source:
 
 - https://archive.org/help/wayback_api.php
 
-### Retry and crawl policy
+### Single-attempt crawl policy
 
 `CONFIRMED`
 
-- Use a `requests.Session` with `urllib3.util.Retry` for safe HTTP methods.
-- Explicitly configure `allowed_methods`, `status_forcelist`, and
-  `respect_retry_after_header=True`.
+- Use a `requests.Session` with automatic retries disabled.
 - Add a single-threaded per-domain monotonic-clock delay and a global request limiter.
 - Use `urllib.robotparser.RobotFileParser`; cache rules per domain.
 - Record every fetch attempt and terminal failure instead of dropping articles.
@@ -191,11 +205,9 @@ Source:
 
 ### Retries and packing
 
-- Construct the client with `max_retries=0`; pipeline pacing and retry handling remain
-  authoritative.
+- Construct the client with `max_retries=0`; the pipeline also makes one attempt only.
 - Keep requests serial and at or below 30 requests/minute.
-- Default to five labeled articles per request, split on token budget, and requeue missing
-  story IDs individually.
+- Default to five labeled articles per request and skip missing story IDs rather than requeueing.
 - Treat five as an experimental default; measure accuracy against hand-labeled cases before
   scaling.
 - Unknown proxy model names fall back to `tiktoken.get_encoding("o200k_base")` for estimates.
