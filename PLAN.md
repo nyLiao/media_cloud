@@ -2,9 +2,9 @@
 
 > **Agent quick start**
 >
-> - **Status:** foundation and Stages 1–3 implemented. Stages 4–5 pending.
-> - **Next action:** configure the Stage 3 contact address, inspect a bounded fetch dry run, then
->   launch `scripts/run_article_fetch.sh` explicitly.
+> - **Status:** Stages 1–5 implemented; long network stages remain user-launched.
+> - **Next action:** inspect a bounded extraction dry run, then launch
+>   `scripts/run_llm_analysis.sh --topic TOPIC --limit N` explicitly.
 > - **Read before editing:** §0 (how to use this doc), §3 (invariants), §5 (data model), then the one stage section you are implementing.
 > - **Do not** run a full-range search, crawl, or LLM pass without explicit user approval.
 >
@@ -69,8 +69,8 @@ that satisfies the higher-priority source.
 | Stage 1 Search | done | `src/mc_pipeline/search.py`, §6.1 |
 | Stage 2 Dedup/QC | done | `src/mc_pipeline/dedup.py`, §6.2 |
 | Stage 3 Fetch | done | `src/mc_pipeline/fetch.py`, §6.3 |
-| Stage 4 Extract | pending | §6.4 |
-| Stage 5 Export | pending | §6.5 |
+| Stage 4 Extract | done | `src/mc_pipeline/extract.py`, `src/mc_pipeline/llm.py`, §6.4 |
+| Stage 5 Export | done | `src/mc_pipeline/export.py`, §6.5 |
 
 ---
 
@@ -488,8 +488,8 @@ def extract_topic(
     connection: sqlite3.Connection,
     *,
     limit: int | None = None,
-    articles_per_request: int | None = None,
     dry_run: bool = False,
+    output_dir: Path = Path("data/out"),
 ) -> StageSummary: ...
 ```
 
@@ -500,38 +500,40 @@ def extract_topic(
 - **S4-R2** Build the schema with `contracts.build_response_json_schema()` and the prompt
   deterministically from topic config; hash the exact system prompt, user-template version,
   and schema.
-- **S4-R3** Client and pipeline both use `max_retries=0`; a failed request is recorded and skipped.
+- **S4-R3** The HTTP adapter never retries internally. Stage 4 performs the configured three
+  serial retries, rate-limiting every logical attempt.
 - **S4-R4** Serial requests, ≤ 30 per minute, via the shared token bucket.
-- **S4-R5** Pack `articles_per_request` (default 5) labelled articles; delimit each with an
-  immutable story ID; validate returned IDs against the batch.
+- **S4-R5** Greedily pack titled, labelled articles under configured `llm.max_input_tokens`;
+  delimit each with an immutable story ID and validate returned IDs against the batch.
 - **S4-R6** Model-provided IDs, URLs, or evidence must never update an unrelated story.
 - **S4-R7** Try strict JSON Schema; on an **explicit unsupported-format** response fall back to
   JSON-object mode with the schema inlined, and record the downgrade once. Do not downgrade on
   unrelated 400s.
 - **S4-R8** Validate every response with `contracts.build_response_model()` even when the
   provider claims strict conformance.
-- **S4-R9** The only extracted fields are `person_name`, `cohort_name`, `private_org`,
-  `private_time`, `public_org`, `public_time`, and `jurisdiction`. Exactly one of person/cohort
-  name is present. Organization fields and jurisdiction are required; times may be null.
+- **S4-R9** Extracted fields, nullability, validation, prompt schema, and CSV columns come from
+  `topic.extraction.fields`. The current topic uses person and transition fields only.
 - **S4-R10** Generate `case_id` with `identity.build_case_id()` (C4); never from the model.
-- **S4-R11** Invalid, ambiguous, or low-confidence output produces **zero** case rows and is not
-  requeued. The prompt explicitly says to omit uncertain findings rather than infer values.
+- **S4-R11** The model returns only relevant articles. Omitted batch IDs become terminal
+  `relevant=false` rows; invalid, ambiguous, or low-confidence output produces zero cases and is
+  not requeued.
 - **S4-R12** Do not request evidence quotes or confidence scores; source text and story ID remain
   the audit link for accepted rows.
-- **S4-R13** Missing story IDs or context overflow are skipped for that batch, without retries.
+- **S4-R13** Unknown or duplicate returned IDs invalidate the attempt. Omitted IDs are valid
+  relevance rejections. Request, parse, and validation failures use the configured retry budget.
 - **S4-R14** Record provider request IDs and usage; never headers or secrets.
-- **S4-R15** Unknown proxy model names fall back to `tiktoken.get_encoding("o200k_base")` for
-  token estimates.
+- **S4-R15** Known model names use `tiktoken`; unknown proxy model names use a conservative local
+  UTF-8 approximation so dry runs never download tokenizer data.
 - **S4-R16** Run extraction only after Stage 2 and successful Stage 3 text acquisition. The search
   corpus is broad—only 366 titles contain `lobby` or `revolving door`—so title absence is not an
   LLM rejection rule, but high-signal fetched articles should be analyzed first.
-- **S4-R17** Use small user-launched batches and inspect accepted-case yield before expanding.
-  Packing five labelled articles per request is the default quota-saving unit; failed, invalid,
-  ambiguous, or low-confidence batches are terminal and never requeued automatically.
+- **S4-R17** Use small user-launched `--limit` values and inspect accepted-case yield before
+  expanding. Requests are serial and dynamically token-packed. Exhausted failures remain
+  retryable and sort behind never-attempted work on later runs. Both CSV snapshots refresh after
+  each committed batch.
 
-**Done when:** one high-confidence individual and one high-confidence cohort validate with only
-the seven configured fields · ambiguous articles yield no case rows · one provider failure does
-not trigger another request.
+**Done when:** config-shaped relevant results validate · omitted and ambiguous articles yield no
+case rows · requests remain serial · every committed batch atomically refreshes both CSVs.
 
 ---
 
@@ -581,7 +583,8 @@ dup_of_story_id,fetch_status,source,text_chars,relevant,reject_reason
 - **S5-R7** `tests/test_contracts.py` already guards config↔`cases`↔CSV agreement and rejects
   a field name that collides with a reserved column. Changing CSV columns silently is prohibited.
 
-**Reconciliation identity:** `distinct_reachable_stories = duplicates + qc_rejects + fetched_ok + fetch_failed + too_short`.
+**Reconciliation identity:** the article-audit CSV row count equals the distinct reachable story
+count, including duplicates, QC rejects, fetch outcomes, and currently unfetched stories.
 
 ---
 
@@ -673,7 +676,7 @@ $UV run ruff format . && $UV run ruff check . && $UV run mypy src
 - **R-DEP-2** Add one only when it materially simplifies a domain problem; justify in `pyproject.toml`.
 - **R-DEP-3** Add stage dependencies only when their code is implemented, so the lock file reflects
   real code. Stage 3 uses `requests`, `trafilatura`, `readability-lxml`, `beautifulsoup4`, and
-  `lxml`; expected later additions include `tenacity`, `rapidfuzz`, `openai`, and `tiktoken`.
+  `lxml`; Stage 4 uses the existing `requests` transport plus `tiktoken` estimates.
 
 ### 7.7 Rate limiting (`ratelimit.py`)
 
@@ -773,6 +776,7 @@ guarantee no quota, paid, or network mutation.
 | `dedup` | database | network, credentials |
 | `fetch` | one live article request | Wayback, LLM |
 | `extract` | LLM over stored text | article URLs |
+| `extract-prompt` | read-only DB, manual request JSON | credentials, network, DB writes |
 | `export` | database, filesystem | network, credentials |
 | `status` | database (read-only) | everything else |
 | `run` | stages in order, stops on infrastructure failure | — |

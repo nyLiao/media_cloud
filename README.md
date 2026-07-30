@@ -124,16 +124,44 @@ The command writes `data/review/<topic>-fetch.csv` by default and includes the s
 article text directly. Failed or blocked fetches and raw HTML paths are excluded. Use `--output`
 to choose another path.
 
-The LLM extraction contract is intentionally limited to `person_name`, `cohort_name`,
-`private_org`, `private_time`, `public_org`, `public_time`, and `jurisdiction`. Preview the exact
-minimal prompt and schema without credentials or a network call:
+The LLM extraction contract is generated from `topics.<name>.extraction.fields`. Prompts include
+article titles and plain labelled delimiters, return only relevant articles, and dynamically pack
+stored text below `llm.max_input_tokens`. Failed requests receive three serial retries; exhausted
+failures remain retryable at the end of later queues. Preview the exact prompt and schema
+without credentials or a network call:
 
 ```bash
 uv run python scripts/preview_llm_prompt.py --topic revolving_door_ca
 ```
 
-Long LLM jobs are user-run through `scripts/run_llm_analysis.sh`. The script currently exits
-with a clear message because Stage 4's `extract` command has not been implemented yet.
+Long LLM jobs are user-run with an explicit article bound. Each committed serial batch refreshes
+the case and article-audit CSV snapshots in `data/out` by default. Live extraction displays a
+Rich progress bar by default in a terminal; the launcher forces it on even while logging through
+`tee`. Pass `--no-progress` to suppress it:
+
+```bash
+scripts/run_llm_analysis.sh --topic revolving_door_ca --limit 25
+```
+
+Rebuild the CSV snapshots without an LLM request using:
+
+```bash
+uv run mc-pipeline export --topic revolving_door_ca
+```
+
+Write a secret-free text file for manual LLM testing. It contains only the system prompt followed
+by the user prompt. Reconstruct an exact stored batch that returned no cases:
+
+```bash
+uv run mc-pipeline extract-prompt --topic revolving_door_ca --batch-id 16 \
+  --output data/review/revolving_door_ca-batch-16-llm-prompts.txt
+```
+
+Or preview one newly planned packed batch without credentials, network calls, or database writes:
+
+```bash
+uv run mc-pipeline extract-prompt --topic revolving_door_ca --limit 10 --batch 1
+```
 
 ## Development
 
@@ -150,9 +178,8 @@ part of the gate.
 The current implementation establishes repository configuration, the versioned SQLite schema,
 deterministic hashing and identifiers (`identity.py`), the config-derived extraction contract
 (`contracts.py`), resumable Stage 1 Media Cloud search with a metadata review export, and
-topic-scoped Stage 2 deduplication/QC, and bounded Stage 3 article acquisition with dry-run and
-interactive progress support. LLM extraction and final case CSV export are implemented in later
-stages described in `PLAN.md`.
+topic-scoped Stage 2 deduplication/QC, bounded Stage 3 article acquisition, serial token-bounded
+Stage 4 extraction, and atomic Stage 5 case/article CSV exports.
 
 `config/topics.yaml` drives behaviour: `extraction.fields` alone determines the JSON Schema
 sent to the model, the validation model, and the exported CSV columns, so adding a field is a

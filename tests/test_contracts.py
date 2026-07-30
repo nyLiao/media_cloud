@@ -23,7 +23,6 @@ def extraction():
 def _individual(**overrides):
     return {
         "person_name": "Ada Example",
-        "cohort_name": None,
         "private_org": "Example Strategies",
         "private_time": "2024",
         "public_org": "Government of Canada",
@@ -33,15 +32,7 @@ def _individual(**overrides):
     }
 
 
-def _cohort(**overrides):
-    return _individual(
-        person_name=None,
-        cohort_name="Former ministerial staff",
-        **overrides,
-    )
-
-
-def test_case_csv_columns_follow_the_seven_field_contract():
+def test_case_csv_columns_follow_configured_field_order():
     topic = load_config().topics["revolving_door_ca"]
 
     assert (
@@ -49,7 +40,6 @@ def test_case_csv_columns_follow_the_seven_field_contract():
         == PROVENANCE_PREFIX
         + (
             "person_name",
-            "cohort_name",
             "private_org",
             "private_time",
             "public_org",
@@ -75,28 +65,16 @@ def test_response_schema_embeds_case_schema(extraction):
     item = schema["properties"]["results"]["items"]
 
     assert item["properties"]["cases"]["items"] == build_case_json_schema(extraction)
+    assert item["properties"]["cases"]["minItems"] == 1
+    assert item["required"] == ["story_id", "cases"]
+    assert "relevant" not in item["properties"]
 
 
-def test_individual_and_cohort_payloads_validate(extraction):
+def test_nullable_identifier_payloads_validate(extraction):
     model = build_case_model(extraction)
 
     assert model.model_validate(_individual()).person_name == "Ada Example"
-    assert model.model_validate(_cohort()).cohort_name == "Former ministerial staff"
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        _individual(person_name=None, cohort_name=None),
-        _individual(cohort_name="Former staff"),
-        _individual(person_name="   "),
-    ],
-)
-def test_model_requires_exactly_one_nonblank_person_or_cohort(extraction, payload):
-    model = build_case_model(extraction)
-
-    with pytest.raises(ValidationError, match="exactly one"):
-        model.model_validate(payload)
+    assert model.model_validate(_individual(person_name=None)).person_name is None
 
 
 @pytest.mark.parametrize("field", ["private_org", "public_org", "jurisdiction"])
@@ -124,18 +102,10 @@ def test_response_model_validates_a_packed_batch(extraction):
             "results": [
                 {
                     "story_id": "s1",
-                    "relevant": True,
-                    "reject_reason": None,
                     "cases": [_individual()],
-                },
-                {
-                    "story_id": "s2",
-                    "relevant": False,
-                    "reject_reason": "No explicit transition.",
-                    "cases": [],
                 },
             ]
         }
     )
 
-    assert [entry.story_id for entry in response.results] == ["s1", "s2"]
+    assert [entry.story_id for entry in response.results] == ["s1"]

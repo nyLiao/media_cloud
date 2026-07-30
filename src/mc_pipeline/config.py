@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from datetime import date
 from pathlib import Path
@@ -59,8 +60,8 @@ class LLMConfig(StrictModel):
     model: str
     timeout_s: float = Field(ge=MIN_QUERY_TIMEOUT_S)
     max_requests_per_min: int = Field(gt=0)
-    articles_per_request: int = Field(gt=0)
-    max_article_chars: int = Field(gt=0)
+    max_retries: int = Field(default=3, ge=0)
+    max_input_tokens: int = Field(gt=0, le=200_000)
     max_output_tokens: int = Field(gt=0)
     temperature: float
     structured_output: Literal["json_schema", "json_object"]
@@ -93,12 +94,18 @@ class ExtractionField(StrictModel):
     required: bool
     description: str
 
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, name: str) -> str:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+            raise ValueError("extraction field names must be SQL/JSON-safe identifiers")
+        return name
+
 
 class ExtractionConfig(StrictModel):
     unit: str
     relevance_criteria: str
     fields: list[ExtractionField]
-    exactly_one_of: list[str] = Field(min_length=2)
 
     @model_validator(mode="after")
     def validate_field_names(self) -> ExtractionConfig:
@@ -106,31 +113,6 @@ class ExtractionConfig(StrictModel):
         duplicates = {name for name in names if names.count(name) > 1}
         if duplicates:
             raise ValueError(f"duplicate extraction field names: {sorted(duplicates)}")
-        return self
-
-    @model_validator(mode="after")
-    def validate_transition_contract(self) -> ExtractionConfig:
-        """Enforce the fixed, minimal transition-extraction contract."""
-        by_name = {field.name: field for field in self.fields}
-        expected_names = {
-            "person_name",
-            "cohort_name",
-            "private_org",
-            "private_time",
-            "public_org",
-            "public_time",
-            "jurisdiction",
-        }
-        if set(by_name) != expected_names:
-            raise ValueError(f"extraction.fields must be exactly: {sorted(expected_names)}")
-        if self.exactly_one_of != ["person_name", "cohort_name"]:
-            raise ValueError('exactly_one_of must be ["person_name", "cohort_name"]')
-        if any(by_name[name].required for name in self.exactly_one_of):
-            raise ValueError("exactly_one_of fields must allow null")
-
-        required_names = {"private_org", "public_org", "jurisdiction"}
-        if {name for name, field in by_name.items() if field.required} != required_names:
-            raise ValueError("only private_org, public_org, and jurisdiction may be required")
         return self
 
 

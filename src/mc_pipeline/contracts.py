@@ -100,14 +100,14 @@ def build_case_json_schema(extraction: ExtractionConfig) -> dict[str, Any]:
 
 
 def build_response_json_schema(extraction: ExtractionConfig) -> dict[str, Any]:
-    """Return the envelope schema for one packed multi-article request."""
+    """Return the relevant-only envelope for one packed multi-article request."""
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "results": {
                 "type": "array",
-                "description": "Exactly one entry per article supplied in this request.",
+                "description": "Only articles containing at least one explicit transition.",
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -118,21 +118,14 @@ def build_response_json_schema(extraction: ExtractionConfig) -> dict[str, Any]:
                                 "Echo the id attribute of the article this entry describes."
                             ),
                         },
-                        "relevant": {
-                            "type": "boolean",
-                            "description": "Whether the article satisfies the relevance criteria.",
-                        },
-                        "reject_reason": {
-                            "type": ["string", "null"],
-                            "description": "Why the article was rejected; null when relevant.",
-                        },
                         "cases": {
                             "type": "array",
-                            "description": "Findings for this article; empty when not relevant.",
+                            "minItems": 1,
+                            "description": "Explicit high-confidence findings for this article.",
                             "items": build_case_json_schema(extraction),
                         },
                     },
-                    "required": ["story_id", "relevant", "reject_reason", "cases"],
+                    "required": ["story_id", "cases"],
                 },
             }
         },
@@ -144,21 +137,14 @@ def _annotation(field: ExtractionField) -> Any:
     return str if field.required else str | None
 
 
-def _exactly_one_validator(extraction: ExtractionConfig) -> Any:
-    """Require nonblank required values and one configured identifier."""
+def _required_value_validator(extraction: ExtractionConfig) -> Any:
+    """Require configured non-null fields to contain nonblank strings."""
 
     def validate(instance: Any) -> Any:
         for field in extraction.fields:
             if field.required and not getattr(instance, field.name).strip():
                 raise ValueError(f"{field.name} must be provided")
 
-        populated = [
-            name
-            for name in extraction.exactly_one_of
-            if (value := getattr(instance, name)) is not None and value.strip()
-        ]
-        if len(populated) != 1:
-            raise ValueError(f"exactly one of {extraction.exactly_one_of} must be provided")
         return instance
 
     return validate
@@ -176,7 +162,7 @@ def _list_of(model: type[BaseModel]) -> Any:
 def build_case_model(extraction: ExtractionConfig) -> type[BaseModel]:
     """Return the model that validates one extracted case.
 
-    This is where nullability and the exactly-one identifier rule are enforced.
+    This is where configured nullability and nonblank required values are enforced.
     """
     definitions: dict[str, Any] = {
         field.name: (
@@ -187,8 +173,8 @@ def build_case_model(extraction: ExtractionConfig) -> type[BaseModel]:
     }
 
     validators: dict[str, Any] = {
-        "validate_exactly_one_identifier": model_validator(mode="after")(
-            _exactly_one_validator(extraction)
+        "validate_required_values": model_validator(mode="after")(
+            _required_value_validator(extraction)
         )
     }
 
@@ -201,16 +187,14 @@ def build_case_model(extraction: ExtractionConfig) -> type[BaseModel]:
 
 
 def build_response_model(extraction: ExtractionConfig) -> type[BaseModel]:
-    """Return the model that validates one packed multi-article response."""
+    """Return the model that validates one relevant-only packed response."""
     case_model = build_case_model(extraction)
 
     story_model = create_model(
         "StoryExtraction",
         __config__=ConfigDict(extra="forbid"),
         story_id=(str, Field(...)),
-        relevant=(bool, Field(...)),
-        reject_reason=(str | None, Field(None)),
-        cases=(_list_of(case_model), Field(default_factory=list)),
+        cases=(_list_of(case_model), Field(min_length=1)),
     )
 
     return create_model(

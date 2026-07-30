@@ -27,12 +27,12 @@ llm:
   model: "glm-5"
   timeout_s: 300
   max_requests_per_min: 30
-  articles_per_request: 5
-  max_article_chars: 12000
+  max_retries: 3
+  max_input_tokens: 100000
   max_output_tokens: 4000
   temperature: 0
   structured_output: json_schema
-  prompt_version: v1
+  prompt_version: v3
 
 topics:
   revolving_door_ca:
@@ -61,16 +61,11 @@ topics:
       relevance_criteria: >-
         The article must explicitly report a high-confidence transition between a
         public-sector organization and a private organization.
-      exactly_one_of: [person_name, cohort_name]
       fields:
         - name: person_name
           type: string
           required: false
-          description: "Full name of the individual; null for cohort findings."
-        - name: cohort_name
-          type: string
-          required: false
-          description: "Short descriptive name for a cohort finding; null for individuals."
+          description: "Full name of the individual."
         - name: private_org
           type: string
           required: true

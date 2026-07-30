@@ -23,12 +23,21 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-from .config import load_config, load_media_cloud_token
+from .config import load_config, load_llm_credentials, load_media_cloud_token
 from .db import connect_db_readonly, init_db
-from .errors import ConfigError, DatabaseError, FetchError, MediaCloudError, MissingCredentialError
+from .errors import (
+    ConfigError,
+    DatabaseError,
+    ExportError,
+    ExtractionError,
+    FetchError,
+    MediaCloudError,
+    MissingCredentialError,
+)
 from .identity import canonical_json
 
 if TYPE_CHECKING:
+    from .extract import ExtractionProgress
     from .fetch import FetchProgress
 
 app = typer.Typer(help="Media Cloud research pipeline.", no_args_is_help=True)
@@ -65,6 +74,20 @@ def _fetch_module() -> ModuleType:
     from . import fetch
 
     return fetch
+
+
+def _extract_module() -> ModuleType:
+    """Load Stage 4 only when an extraction command runs."""
+    from . import extract
+
+    return extract
+
+
+def _export_module() -> ModuleType:
+    """Load Stage 5 only when an export command runs."""
+    from . import export
+
+    return export
 
 
 class _RichFetchProgressReporter:
@@ -131,6 +154,47 @@ class _RichFetchProgressReporter:
             self._progress.stop()
 
 
+class _RichExtractionProgressReporter:
+    """Render bounded live Stage 4 batch progress."""
+
+    def __init__(self, *, enabled: bool) -> None:
+        self._console = Console(stderr=True, force_terminal=enabled)
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TextColumn("ok={task.fields[succeeded]} failed={task.fields[failed]}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=self._console,
+            disable=not enabled,
+        )
+        self._task_id: TaskID | None = None
+
+    def __call__(self, update: ExtractionProgress) -> None:
+        if self._task_id is None:
+            self._progress.start()
+            self._task_id = self._progress.add_task(
+                "starting",
+                total=update.total,
+                succeeded=0,
+                failed=0,
+            )
+        self._progress.update(
+            self._task_id,
+            completed=update.processed,
+            description=f"batch {update.batch}/{update.batch_count} [{update.status}]",
+            succeeded=update.succeeded,
+            failed=update.failed,
+        )
+
+    def close(self) -> None:
+        if self._task_id is not None:
+            self._progress.stop()
+
+
 def _exit_code(error: BaseException) -> int:
     """Translate typed pipeline errors to the documented CLI exit codes."""
     if isinstance(error, MissingCredentialError):
@@ -141,6 +205,10 @@ def _exit_code(error: BaseException) -> int:
         return 4
     if isinstance(error, (MediaCloudError, FetchError)):
         return 5
+    if isinstance(error, ExtractionError):
+        return 6
+    if isinstance(error, ExportError):
+        return 7
     raise error
 
 
@@ -323,6 +391,146 @@ def fetch_articles(
     _run_command(operation)
 
 
+@app.command("extract")
+def extract_cases(
+    topic: Annotated[str, typer.Option("--topic", help="Configured topic name.")],
+    config_path: Annotated[
+        Path, typer.Option("--config", help="YAML configuration path.")
+    ] = DEFAULT_CONFIG_PATH,
+    env_file: Annotated[
+        Path, typer.Option("--env-file", help="LLM credentials file.")
+    ] = DEFAULT_ENV_FILE,
+    db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DATABASE_PATH,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", min=1, help="Process at most this many candidate articles."),
+    ] = None,
+    output_dir: Annotated[
+        Path, typer.Option("--output-dir", help="Directory for live Stage 5 CSV snapshots.")
+    ] = Path("data/out"),
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Preview token-bounded batches without writes or network."),
+    ] = False,
+    progress: Annotated[
+        bool | None,
+        typer.Option(
+            "--progress/--no-progress",
+            help="Show or suppress interactive extraction progress (default: auto).",
+        ),
+    ] = None,
+) -> None:
+    """Extract structured cases from stored article text."""
+
+    def operation() -> None:
+        app_config = load_config(config_path)
+        credentials = None if dry_run else load_llm_credentials(app_config, env_file)
+        connection = _stage_connection(db, dry_run=dry_run)
+        progress_enabled = False
+        if not dry_run:
+            progress_enabled = sys.stderr.isatty() if progress is None else progress
+        reporter = _RichExtractionProgressReporter(enabled=progress_enabled)
+        try:
+            summary = _extract_module().extract_topic(
+                app_config,
+                topic,
+                connection,
+                limit=limit,
+                dry_run=dry_run,
+                credentials=credentials,
+                output_dir=output_dir,
+                progress=reporter,
+            )
+        finally:
+            reporter.close()
+            connection.close()
+        _echo_summary(summary)
+
+    _run_command(operation)
+
+
+@app.command("extract-prompt")
+def extract_prompt(
+    topic: Annotated[str, typer.Option("--topic", help="Configured topic name.")],
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", min=1, help="Bound candidate articles before prompt packing."),
+    ] = None,
+    batch: Annotated[
+        int,
+        typer.Option("--batch", min=1, help="One-based packed batch to write."),
+    ] = 1,
+    extraction_batch_id: Annotated[
+        int | None,
+        typer.Option("--batch-id", min=1, help="Reconstruct an exact stored extraction batch."),
+    ] = None,
+    config_path: Annotated[
+        Path, typer.Option("--config", help="YAML configuration path.")
+    ] = DEFAULT_CONFIG_PATH,
+    db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DATABASE_PATH,
+    output: Annotated[
+        Path | None, typer.Option("--output", help="Secret-free manual prompt text path.")
+    ] = None,
+) -> None:
+    """Write one exact no-network LLM prompt pair for manual verification."""
+
+    def operation() -> None:
+        app_config = load_config(config_path)
+        output_path = output or Path("data/review") / f"{topic}-llm-prompts.txt"
+        connection = connect_db_readonly(db)
+        try:
+            artifact = _extract_module().build_manual_request(
+                app_config,
+                topic,
+                connection,
+                limit=limit,
+                batch_number=batch,
+                extraction_batch_id=extraction_batch_id,
+            )
+        finally:
+            connection.close()
+        _extract_module().write_manual_request(artifact, output_path)
+        source = (
+            f"stored_batch={artifact['source_extraction_batch_id']}"
+            if "source_extraction_batch_id" in artifact
+            else f"batch={artifact['batch_number']}/{artifact['batch_count']}"
+        )
+        typer.echo(
+            f"Manual LLM prompts: {output_path} ({source}, "
+            f"articles={len(artifact['story_ids'])}, "
+            f"estimated_input_tokens={artifact['estimated_input_tokens']})"
+        )
+
+    _run_command(operation)
+
+
+@app.command("export")
+def export_results(
+    topic: Annotated[str, typer.Option("--topic", help="Configured topic name.")],
+    config_path: Annotated[
+        Path, typer.Option("--config", help="YAML configuration path.")
+    ] = DEFAULT_CONFIG_PATH,
+    db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DATABASE_PATH,
+    output_dir: Annotated[
+        Path, typer.Option("--output-dir", help="Directory for Stage 5 CSV files.")
+    ] = Path("data/out"),
+) -> None:
+    """Export case and article-audit CSV snapshots."""
+
+    def operation() -> None:
+        app_config = load_config(config_path)
+        connection = connect_db_readonly(db)
+        try:
+            summary = _export_module().export_topic(
+                app_config, topic, connection, output_dir=output_dir
+            )
+        finally:
+            connection.close()
+        _echo_summary(summary)
+
+    _run_command(operation)
+
+
 @app.command("review-search")
 def review_search(
     topic: Annotated[str, typer.Option("--topic", help="Configured topic name.")],
@@ -359,7 +567,7 @@ def review_fetch(
             "--limit",
             min=1,
             max=100,
-            help="Export at most this many successful articles; required to prevent full-DB review.",
+            help="Maximum successful articles to export (required; 1-100).",
         ),
     ],
     config_path: Annotated[
