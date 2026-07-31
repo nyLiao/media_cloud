@@ -7,7 +7,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import typer
 from rich.console import Console
@@ -35,6 +35,7 @@ from .errors import (
     MissingCredentialError,
 )
 from .identity import canonical_json
+from .stage import StageSummary
 
 if TYPE_CHECKING:
     from .extract import ExtractionProgress
@@ -190,6 +191,11 @@ class _RichExtractionProgressReporter:
             failed=update.failed,
         )
 
+    def event(self, detail: str) -> None:
+        """Print one structured extraction event without disrupting live progress."""
+        self._console.print(detail, markup=False, highlight=False, soft_wrap=True)
+        self._console.file.flush()
+
     def close(self) -> None:
         if self._task_id is not None:
             self._progress.stop()
@@ -224,6 +230,15 @@ def _run_command(operation: Callable[[], None]) -> None:
 def _echo_summary(summary: object) -> None:
     """Print the service-provided StageSummary representation."""
     typer.echo(str(summary))
+
+
+def _echo_extract_summary(summary: StageSummary) -> None:
+    """Print only final extraction counts after live request event output."""
+    summary_line = (
+        f"topic={summary.topic} processed={summary.processed} "
+        f"succeeded={summary.succeeded} skipped={summary.skipped} failed={summary.failed}"
+    )
+    typer.echo(summary_line)
 
 
 @app.callback()
@@ -440,11 +455,12 @@ def extract_cases(
                 credentials=credentials,
                 output_dir=output_dir,
                 progress=reporter,
+                detail_reporter=reporter.event,
             )
         finally:
             reporter.close()
             connection.close()
-        _echo_summary(summary)
+        _echo_extract_summary(summary)
 
     _run_command(operation)
 
@@ -464,6 +480,10 @@ def extract_prompt(
         int | None,
         typer.Option("--batch-id", min=1, help="Reconstruct an exact stored extraction batch."),
     ] = None,
+    phase: Annotated[
+        Literal["screening", "extraction"],
+        typer.Option("--phase", help="Planned prompt phase: screening or extraction."),
+    ] = "screening",
     config_path: Annotated[
         Path, typer.Option("--config", help="YAML configuration path.")
     ] = DEFAULT_CONFIG_PATH,
@@ -486,6 +506,7 @@ def extract_prompt(
                 limit=limit,
                 batch_number=batch,
                 extraction_batch_id=extraction_batch_id,
+                phase=phase,
             )
         finally:
             connection.close()
@@ -497,7 +518,7 @@ def extract_prompt(
         )
         typer.echo(
             f"Manual LLM prompts: {output_path} ({source}, "
-            f"articles={len(artifact['story_ids'])}, "
+            f"phase={artifact['phase']}, articles={len(artifact['story_ids'])}, "
             f"estimated_input_tokens={artifact['estimated_input_tokens']})"
         )
 

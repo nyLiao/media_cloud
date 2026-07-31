@@ -101,6 +101,23 @@ _ARTICLE_AUDIT_QUERY = """
         FROM search_hits
         JOIN search_windows ON search_windows.id = search_hits.search_window_id
         WHERE search_windows.topic = ?
+    ), latest_screenings AS (
+        SELECT story_id, relevant, validation_status, prompt_version
+        FROM (
+            SELECT
+                story_extractions.story_id,
+                story_extractions.relevant,
+                story_extractions.validation_status,
+                story_extractions.prompt_version,
+                ROW_NUMBER() OVER (
+                    PARTITION BY story_extractions.story_id
+                    ORDER BY story_extractions.extracted_at DESC, story_extractions.id DESC
+                ) AS row_number
+            FROM story_extractions
+            WHERE story_extractions.topic = ?
+              AND story_extractions.prompt_version = ?
+        )
+        WHERE row_number = 1
     ), latest_extractions AS (
         SELECT story_id, relevant, reject_reason
         FROM (
@@ -132,6 +149,9 @@ _ARTICLE_AUDIT_QUERY = """
         articles.fetch_status,
         articles.source,
         articles.text_chars,
+        latest_screenings.relevant AS screening_relevant,
+        latest_screenings.validation_status AS screening_validation_status,
+        latest_screenings.prompt_version AS screening_prompt_version,
         latest_extractions.relevant,
         latest_extractions.reject_reason
     FROM reachable_stories
@@ -140,6 +160,7 @@ _ARTICLE_AUDIT_QUERY = """
         ON story_topic_state.topic = ?
        AND story_topic_state.story_id = stories.story_id
     LEFT JOIN articles ON articles.story_id = stories.story_id
+    LEFT JOIN latest_screenings ON latest_screenings.story_id = stories.story_id
     LEFT JOIN latest_extractions ON latest_extractions.story_id = stories.story_id
     ORDER BY stories.publish_date ASC, stories.story_id ASC
 """
@@ -212,6 +233,8 @@ def export_topic(
                 _ARTICLE_AUDIT_QUERY,
                 (
                     topic_name,
+                    topic_name,
+                    config.llm.screening_prompt_version,
                     topic_name,
                     config.llm.prompt_version,
                     topic_name,

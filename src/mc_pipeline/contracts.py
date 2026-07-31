@@ -8,10 +8,17 @@ order -- so the three cannot drift apart.
 
 from __future__ import annotations
 
+import re
 from types import GenericAlias
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    create_model,
+    field_validator,
+)
 
 from .config import ExtractionConfig, ExtractionField, TopicConfig
 
@@ -70,26 +77,30 @@ ARTICLE_AUDIT_COLUMNS: tuple[str, ...] = (
     "fetch_status",
     "source",
     "text_chars",
+    "screening_relevant",
+    "screening_validation_status",
+    "screening_prompt_version",
     "relevant",
     "reject_reason",
 )
 
-
 def _field_schema(field: ExtractionField) -> dict[str, Any]:
-    return {
-        "type": "string" if field.required else ["string", "null"],
+    schema: dict[str, Any] = {
+        "type": ["string", "null"],
         "description": field.description,
     }
+    if field.regex is not None:
+        schema["pattern"] = field.regex
+    if field.allowed_values is not None:
+        schema["enum"] = [*field.allowed_values, None]
+    return schema
 
 
 def build_case_json_schema(extraction: ExtractionConfig) -> dict[str, Any]:
     """Return the strict-mode object schema for one extracted case.
 
-    Strict structured outputs require *every* property to appear in ``required``;
-    optionality is expressed as a nullable type union instead. So
-    ``ExtractionField.required`` controls nullability here and real requiredness in
-    :func:`build_case_model`. Mapping it onto this ``required`` array would make the
-    provider reject the schema.
+    Strict structured outputs require every property to appear in ``required``;
+    configured values remain optional through nullable types.
     """
     return {
         "type": "object",
@@ -99,15 +110,15 @@ def build_case_json_schema(extraction: ExtractionConfig) -> dict[str, Any]:
     }
 
 
-def build_response_json_schema(extraction: ExtractionConfig) -> dict[str, Any]:
-    """Return the relevant-only envelope for one packed multi-article request."""
+def build_screening_json_schema(extraction: ExtractionConfig) -> dict[str, Any]:
+    """Return the exact per-article Stage 1 screening decision schema."""
+    del extraction
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "results": {
+            "decisions": {
                 "type": "array",
-                "description": "Only articles containing at least one explicit transition.",
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -115,39 +126,53 @@ def build_response_json_schema(extraction: ExtractionConfig) -> dict[str, Any]:
                         "story_id": {
                             "type": "string",
                             "description": (
-                                "Echo the id attribute of the article this entry describes."
+                                "Echo the immutable id of the article this entry describes."
                             ),
                         },
-                        "cases": {
-                            "type": "array",
-                            "minItems": 1,
-                            "description": "Explicit high-confidence findings for this article.",
-                            "items": build_case_json_schema(extraction),
+                        "relevant": {
+                            "type": "boolean",
+                            "description": (
+                                "True only when the article meets the supplied criteria."
+                            ),
                         },
                     },
+                    "required": ["story_id", "relevant"],
+                },
+            }
+        },
+        "required": ["decisions"],
+    }
+
+
+def build_response_json_schema(extraction: ExtractionConfig) -> dict[str, Any]:
+    """Return a relevant-only detailed-extraction envelope for one packed request."""
+    properties = {
+        "story_id": {
+            "type": "string",
+            "description": "Echo the immutable id of the article this result describes.",
+        },
+        "cases": {
+            "type": "array",
+            "description": "Explicit high-confidence findings for this relevant article.",
+            "items": build_case_json_schema(extraction),
+        },
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": properties,
                     "required": ["story_id", "cases"],
                 },
             }
         },
         "required": ["results"],
     }
-
-
-def _annotation(field: ExtractionField) -> Any:
-    return str if field.required else str | None
-
-
-def _required_value_validator(extraction: ExtractionConfig) -> Any:
-    """Require configured non-null fields to contain nonblank strings."""
-
-    def validate(instance: Any) -> Any:
-        for field in extraction.fields:
-            if field.required and not getattr(instance, field.name).strip():
-                raise ValueError(f"{field.name} must be provided")
-
-        return instance
-
-    return validate
 
 
 def _list_of(model: type[BaseModel]) -> Any:
@@ -162,22 +187,20 @@ def _list_of(model: type[BaseModel]) -> Any:
 def build_case_model(extraction: ExtractionConfig) -> type[BaseModel]:
     """Return the model that validates one extracted case.
 
-    This is where configured nullability and nonblank required values are enforced.
+    Configured fields are optional and nullable so incomplete model output remains auditable.
     """
     definitions: dict[str, Any] = {
         field.name: (
-            _annotation(field),
-            Field(... if field.required else None, description=field.description),
+            str | None,
+            Field(None, description=field.description),
         )
         for field in extraction.fields
     }
-
-    validators: dict[str, Any] = {
-        "validate_required_values": model_validator(mode="after")(
-            _required_value_validator(extraction)
-        )
+    validators = {
+        f"validate_{field.name}_constraints": _field_constraint_validator(field)
+        for field in extraction.fields
+        if field.regex is not None or field.allowed_values is not None
     }
-
     return create_model(
         "ExtractedCase",
         __config__=ConfigDict(extra="forbid"),
@@ -186,19 +209,58 @@ def build_case_model(extraction: ExtractionConfig) -> type[BaseModel]:
     )
 
 
-def build_response_model(extraction: ExtractionConfig) -> type[BaseModel]:
-    """Return the model that validates one relevant-only packed response."""
-    case_model = build_case_model(extraction)
+def _field_constraint_validator(field: ExtractionField) -> Any:
+    pattern = re.compile(field.regex) if field.regex is not None else None
+    allowed_values = set(field.allowed_values) if field.allowed_values is not None else None
 
+    @field_validator(field.name)
+    @classmethod
+    def validate_constraint(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if pattern is not None and pattern.fullmatch(value) is None:
+            raise ValueError(f"{field.name} must match configured regex")
+        if allowed_values is not None and value not in allowed_values:
+            raise ValueError(f"{field.name} must be an allowed value")
+        return value
+
+    return validate_constraint
+
+
+def _response_model(extraction: ExtractionConfig, *, include_cases: bool) -> type[BaseModel]:
+    if not include_cases:
+        screening_model = create_model(
+            "ScreeningArticle",
+            __config__=ConfigDict(extra="forbid"),
+            story_id=(str, Field(...)),
+            relevant=(bool, Field(...)),
+        )
+        return create_model(
+            "ScreeningResponse",
+            __config__=ConfigDict(extra="forbid"),
+            decisions=(_list_of(screening_model), Field(default_factory=list)),
+        )
+    definitions: dict[str, Any] = {
+        "story_id": (str, Field(...)),
+        "cases": (_list_of(build_case_model(extraction)), Field(default_factory=list)),
+    }
     story_model = create_model(
-        "StoryExtraction",
+        "ExtractionArticle",
         __config__=ConfigDict(extra="forbid"),
-        story_id=(str, Field(...)),
-        cases=(_list_of(case_model), Field(min_length=1)),
+        **definitions,
     )
-
     return create_model(
         "ExtractionResponse",
         __config__=ConfigDict(extra="forbid"),
         results=(_list_of(story_model), Field(default_factory=list)),
     )
+
+
+def build_response_model(extraction: ExtractionConfig) -> type[BaseModel]:
+    """Return the model that validates one complete extraction response."""
+    return _response_model(extraction, include_cases=True)
+
+
+def build_screening_model(extraction: ExtractionConfig) -> type[BaseModel]:
+    """Return the model that validates exact per-article screening decisions."""
+    return _response_model(extraction, include_cases=False)

@@ -69,7 +69,7 @@ def _config() -> AppConfig:
                             {
                                 "name": "private_org",
                                 "type": "string",
-                                "required": True,
+                                "required": False,
                                 "description": "Private organization",
                             },
                             {
@@ -81,7 +81,7 @@ def _config() -> AppConfig:
                             {
                                 "name": "public_org",
                                 "type": "string",
-                                "required": True,
+                                "required": False,
                                 "description": "Public organization",
                             },
                             {
@@ -93,7 +93,7 @@ def _config() -> AppConfig:
                             {
                                 "name": "jurisdiction",
                                 "type": "string",
-                                "required": True,
+                                "required": False,
                                 "description": "Jurisdiction",
                             },
                         ],
@@ -152,6 +152,15 @@ def test_export_writes_configured_cases_and_all_reachable_article_rows(tmp_path)
             VALUES ('story-1', 'ok', 'web', 42)
             """
         )
+        connection.execute(
+            """
+            INSERT INTO story_extractions(
+                topic, story_id, prompt_version, relevant, validation_status, extracted_at
+            )
+            VALUES ('door', 'story-1', ?, 1, 'valid', '2021-01-02T00:00:00Z')
+            """,
+            (config.llm.screening_prompt_version,),
+        )
         extraction_id = connection.execute(
             """
             INSERT INTO story_extractions(
@@ -190,6 +199,9 @@ def test_export_writes_configured_cases_and_all_reachable_article_rows(tmp_path)
         assert cases[0]["source_url"] == "https://example.test/story-1"
         assert tuple(articles[0]) == ARTICLE_AUDIT_COLUMNS
         assert [row["story_id"] for row in articles] == ["story-1", "story-2"]
+        assert articles[0]["screening_relevant"] == "1"
+        assert articles[0]["screening_validation_status"] == "valid"
+        assert articles[0]["screening_prompt_version"] == config.llm.screening_prompt_version
         assert articles[1]["fetch_status"] == ""
         assert articles[1]["relevant"] == ""
         assert articles[1]["dup_of_story_id"] == "story-1"

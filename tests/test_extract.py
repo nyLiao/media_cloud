@@ -17,7 +17,12 @@ from mc_pipeline.extract import (
     write_manual_request,
 )
 from mc_pipeline.llm import LLMResponse
-from mc_pipeline.prompt import SYSTEM_PROMPT, PromptArticle, build_extraction_prompt
+from mc_pipeline.prompt import (
+    SCREENING_SYSTEM_PROMPT,
+    PromptArticle,
+    build_extraction_prompt,
+    build_screening_prompt,
+)
 
 
 class FakeEstimator:
@@ -91,10 +96,10 @@ def _case(person_name: str | None = "Ada Example") -> dict[str, str | None]:
     return {
         "person_name": person_name,
         "private_org": "Example Strategies",
-        "private_time": "2024",
+        "private_time": "2024-2024",
         "public_org": "Government of Canada",
-        "public_time": "2021",
-        "jurisdiction": "Canada",
+        "public_time": "2021-2021",
+        "jurisdiction": "Ontario",
     }
 
 
@@ -108,15 +113,16 @@ def _response(content: str) -> LLMResponse:
     )
 
 
-def test_prompt_includes_dynamic_schema_titles_and_plain_delimiters():
-    extraction = load_config().topics["revolving_door_ca"].extraction
+def test_prompt_includes_compact_output_shape_and_plain_delimiters():
+    topic = load_config().topics["revolving_door_ca"]
 
     prompt = build_extraction_prompt(
-        extraction,
+        topic,
         [PromptArticle("story-1", "Quoted title", "Stored article text")],
     )
 
-    assert "OUTPUT SCHEMA" in prompt
+    assert "OUTPUT SCHEMA" not in prompt
+    assert "Return only JSON:" in prompt
     assert '"person_name"' in prompt
     assert 'title: "Quoted title"' in prompt
     assert "--- ARTICLE START ---" in prompt
@@ -124,22 +130,22 @@ def test_prompt_includes_dynamic_schema_titles_and_plain_delimiters():
 
 
 def test_packing_uses_token_ceiling_and_truncates_oversized_article():
-    extraction = load_config().topics["revolving_door_ca"].extraction
+    topic = load_config().topics["revolving_door_ca"]
     candidates = [
-        Candidate("story-1", "One", "a" * 1800),
-        Candidate("story-2", "Two", "b" * 1800),
+        Candidate("story-1", "One", "a" * 10_000),
+        Candidate("story-2", "Two", "b" * 10_000),
     ]
 
     batches = pack_candidates(
         candidates,
-        extraction=extraction,
+        topic=topic,
         estimator=FakeEstimator(),
-        max_input_tokens=2600,
+        max_input_tokens=7000,
     )
 
     assert [len(batch.articles) for batch in batches] == [1, 1]
-    assert all(batch.estimated_tokens <= 2600 for batch in batches)
-    assert len(batches[0].articles[0].text) < 1800
+    assert all(batch.estimated_tokens <= 7000 for batch in batches)
+    assert len(batches[0].articles[0].text) < 10_000
 
 
 def test_extract_persists_relevant_and_omitted_articles_then_exports(tmp_path):
@@ -148,10 +154,32 @@ def test_extract_persists_relevant_and_omitted_articles_then_exports(tmp_path):
     try:
         _seed_article(connection, "story-1", title="Lobby transition", text="Text one " * 100)
         _seed_article(connection, "story-2", title="Other story", text="Text two " * 100)
-        client = FakeClient([{"results": [{"story_id": "story-1", "cases": [_case()]}]}])
+        client = FakeClient(
+            [
+                {
+                    "decisions": [
+                        {"story_id": "story-1", "relevant": True},
+                        {"story_id": "story-2", "relevant": False},
+                    ]
+                },
+                {
+                    "results": [
+                        {
+                            "story_id": "story-1",
+                            "cases": [_case()],
+                        }
+                    ]
+                },
+            ]
+        )
         limiter = FakeLimiter()
         exports: list[int] = []
         progress_updates = []
+        event_details: list[dict[str, object]] = []
+
+        def report_event(detail: str) -> None:
+            assert len(exports) == len(event_details) + 1
+            event_details.append(json.loads(detail))
 
         summary = extract_topic(
             config,
@@ -163,24 +191,46 @@ def test_extract_persists_relevant_and_omitted_articles_then_exports(tmp_path):
             _rate_limiter=limiter,
             _exporter=lambda: exports.append(1),
             progress=progress_updates.append,
+            detail_reporter=report_event,
         )
 
-        rows = connection.execute(
-            "SELECT story_id, relevant, validation_status FROM story_extractions ORDER BY story_id"
+        screenings = connection.execute(
+            """
+            SELECT story_id, relevant, validation_status FROM story_extractions
+            WHERE prompt_version = ? ORDER BY story_id
+            """,
+            (config.llm.screening_prompt_version,),
         ).fetchall()
-        assert [tuple(row) for row in rows] == [
+        assert [tuple(row) for row in screenings] == [
             ("story-1", 1, "valid"),
             ("story-2", 0, "valid"),
         ]
+        rows = connection.execute(
+            """
+            SELECT story_id, relevant, validation_status FROM story_extractions
+            WHERE prompt_version = ?
+            """,
+            (config.llm.prompt_version,),
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [("story-1", 1, "valid")]
         assert connection.execute("SELECT COUNT(*) FROM cases").fetchone()[0] == 1
-        assert summary.processed == summary.succeeded == 2
+        assert summary.processed == summary.succeeded == 3
         assert summary.failed == 0
-        assert limiter.calls == 1
-        assert exports == [1]
+        assert limiter.calls == 2
+        assert exports == [1, 1]
+        assert [event["event"] for event in event_details] == [
+            "llm_batch_completed",
+            "llm_batch_completed",
+        ]
         assert [
             (update.processed, update.total, update.batch, update.batch_count, update.status)
             for update in progress_updates
-        ] == [(0, 2, 1, 1, "requesting"), (2, 2, 1, 1, "completed")]
+        ] == [
+            (0, 2, 1, 1, "screening: requesting"),
+            (2, 2, 1, 1, "screening: completed"),
+            (2, 3, 1, 1, "extraction: requesting"),
+            (3, 3, 1, 1, "extraction: completed"),
+        ]
     finally:
         connection.close()
 
@@ -190,7 +240,7 @@ def test_unknown_story_id_invalidates_entire_batch_without_cases(tmp_path):
     connection = init_db(tmp_path / "pipeline.db")
     try:
         _seed_article(connection, "story-1", title="Lobby transition", text="Text " * 100)
-        client = FakeClient([{"results": [{"story_id": "unknown", "cases": [_case()]}]}] * 4)
+        client = FakeClient([{"decisions": [{"story_id": "unknown", "relevant": True}]}] * 4)
 
         summary = extract_topic(
             config,
@@ -204,7 +254,8 @@ def test_unknown_story_id_invalidates_entire_batch_without_cases(tmp_path):
         )
 
         row = connection.execute(
-            "SELECT relevant, validation_status FROM story_extractions"
+            "SELECT relevant, validation_status FROM story_extractions WHERE prompt_version = ?",
+            (config.llm.screening_prompt_version,),
         ).fetchone()
         assert tuple(row) == (None, "invalid")
         assert connection.execute("SELECT COUNT(*) FROM cases").fetchone()[0] == 0
@@ -253,7 +304,15 @@ def test_extract_retries_then_persists_one_successful_extraction(tmp_path):
         client = FakeClient(
             [
                 ExtractionError("temporary provider failure"),
-                {"results": [{"story_id": "story-1", "cases": [_case()]}]},
+                {"decisions": [{"story_id": "story-1", "relevant": True}]},
+                {
+                    "results": [
+                        {
+                            "story_id": "story-1",
+                            "cases": [_case()],
+                        }
+                    ]
+                },
             ]
         )
         limiter = FakeLimiter()
@@ -269,14 +328,23 @@ def test_extract_retries_then_persists_one_successful_extraction(tmp_path):
             _exporter=lambda: None,
         )
 
-        assert summary.processed == summary.succeeded == 1
+        assert summary.processed == summary.succeeded == 2
         assert summary.failed == 0
-        assert len(client.calls) == limiter.calls == 2
-        assert connection.execute("SELECT COUNT(*) FROM story_extractions").fetchone()[0] == 1
-        batch = connection.execute(
-            "SELECT status, attempt_count FROM extraction_batches"
-        ).fetchone()
-        assert tuple(batch) == ("completed", 2)
+        assert len(client.calls) == limiter.calls == 3
+        assert connection.execute(
+            "SELECT COUNT(*) FROM story_extractions WHERE prompt_version = ?",
+            (config.llm.prompt_version,),
+        ).fetchone()[0] == 1
+        batches = connection.execute(
+            """
+            SELECT json_extract(request_json, '$.phase'), status, attempt_count
+            FROM extraction_batches ORDER BY id
+            """
+        ).fetchall()
+        assert [tuple(batch) for batch in batches] == [
+            ("screening", "completed", 2),
+            ("extraction", "completed", 1),
+        ]
     finally:
         connection.close()
 
@@ -296,7 +364,7 @@ def test_extract_retries_all_failure_types_then_keeps_retryable_unparsed_row(
         elif failure_kind == "parse":
             failures = [_response("not valid JSON")] * 4
         else:
-            failures = [{"results": [{"story_id": "unknown", "cases": [_case()]}]}] * 4
+            failures = [{"decisions": [{"story_id": "unknown", "relevant": True}]}] * 4
         client = FakeClient(failures)
         limiter = FakeLimiter()
 
@@ -318,10 +386,11 @@ def test_extract_retries_all_failure_types_then_keeps_retryable_unparsed_row(
         ).fetchone()
         expected_status = "invalid" if failure_kind == "schema" else "unparsed"
         assert tuple(batch) == (expected_status, 4)
-        extraction = connection.execute(
-            "SELECT relevant, validation_status FROM story_extractions"
+        screening = connection.execute(
+            "SELECT relevant, validation_status FROM story_extractions WHERE prompt_version = ?",
+            (config.llm.screening_prompt_version,),
         ).fetchone()
-        assert tuple(extraction) == (None, expected_status)
+        assert tuple(screening) == (None, expected_status)
 
         recovered = extract_topic(
             config,
@@ -329,17 +398,64 @@ def test_extract_retries_all_failure_types_then_keeps_retryable_unparsed_row(
             connection,
             limit=1,
             credentials=LLMCredentials(base_url="https://llm.test/v1", api_key=SecretStr("x")),
-            _client=FakeClient([{"results": []}]),
+            _client=FakeClient([{"decisions": [{"story_id": "story-1", "relevant": False}]}]),
             _rate_limiter=FakeLimiter(),
             _exporter=lambda: None,
         )
 
         assert recovered.succeeded == 1
-        assert connection.execute("SELECT COUNT(*) FROM story_extractions").fetchone()[0] == 1
-        extraction = connection.execute(
-            "SELECT relevant, validation_status FROM story_extractions"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM story_extractions WHERE prompt_version = ?",
+            (config.llm.prompt_version,),
+        ).fetchone()[0] == 0
+        screening = connection.execute(
+            "SELECT relevant, validation_status FROM story_extractions WHERE prompt_version = ?",
+            (config.llm.screening_prompt_version,),
         ).fetchone()
-        assert tuple(extraction) == (0, "valid")
+        assert tuple(screening) == (0, "valid")
+    finally:
+        connection.close()
+
+
+def test_extract_reports_attempts_and_terminal_batch_failure_before_return(tmp_path):
+    config = load_config()
+    connection = init_db(tmp_path / "pipeline.db")
+    returned = False
+    event_details: list[dict[str, object]] = []
+
+    def report_event(detail: str) -> None:
+        assert not returned
+        event_details.append(json.loads(detail))
+
+    try:
+        _seed_article(connection, "story-1", title="Lobby transition", text="Text " * 100)
+        summary = extract_topic(
+            config,
+            "revolving_door_ca",
+            connection,
+            limit=1,
+            credentials=LLMCredentials(base_url="https://llm.test/v1", api_key=SecretStr("x")),
+            _client=FakeClient([ExtractionError("temporary provider failure")] * 4),
+            _rate_limiter=FakeLimiter(),
+            _exporter=lambda: None,
+            detail_reporter=report_event,
+        )
+        returned = True
+
+        assert [event["event"] for event in event_details] == [
+            "llm_attempt_failed",
+            "llm_attempt_failed",
+            "llm_attempt_failed",
+            "llm_attempt_failed",
+            "llm_batch_failed",
+        ]
+        assert event_details[-1]["attempts"] == 4
+        summary_events = []
+        for detail in summary.request_details:
+            parsed_detail = json.loads(detail)
+            if parsed_detail.get("event") in {"llm_attempt_failed", "llm_batch_failed"}:
+                summary_events.append(parsed_detail)
+        assert event_details == summary_events
     finally:
         connection.close()
 
@@ -358,9 +474,9 @@ def test_candidate_selection_prioritizes_new_stories_and_excludes_valid_nonmatch
             VALUES ('revolving_door_ca', ?, ?, ?, ?)
             """,
             [
-                ("story-1", config.llm.prompt_version, None, "invalid"),
-                ("story-2", config.llm.prompt_version, None, "unparsed"),
-                ("story-5", config.llm.prompt_version, 0, "valid"),
+                ("story-1", config.llm.screening_prompt_version, None, "invalid"),
+                ("story-2", config.llm.screening_prompt_version, None, "unparsed"),
+                ("story-5", config.llm.screening_prompt_version, 0, "valid"),
             ],
         )
         connection.commit()
@@ -368,7 +484,7 @@ def test_candidate_selection_prioritizes_new_stories_and_excludes_valid_nonmatch
         candidates = _candidate_rows(
             connection,
             "revolving_door_ca",
-            config.llm.prompt_version,
+            config.llm.screening_prompt_version,
             config.topics["revolving_door_ca"].fetch_priority_title_terms,
             limit=None,
         )
@@ -390,7 +506,7 @@ def test_manual_request_selects_one_bounded_batch_and_writes_prompt_only_artifac
 
     config = load_config()
     config = config.model_copy(
-        update={"llm": config.llm.model_copy(update={"max_input_tokens": 150})}
+        update={"llm": config.llm.model_copy(update={"screening_max_input_tokens": 150})}
     )
     connection = init_db(tmp_path / "pipeline.db")
     monkeypatch.setattr(extract_module, "TokenEstimator", FakeManualRequestEstimator)
@@ -411,18 +527,18 @@ def test_manual_request_selects_one_bounded_batch_and_writes_prompt_only_artifac
         output = tmp_path / "manual-request.json"
 
         assert write_manual_request(artifact, output) == output
-        assert artifact["prompt_version"] == config.llm.prompt_version
+        assert artifact["prompt_version"] == config.llm.screening_prompt_version
         assert artifact["story_ids"] == ["story-2"]
         assert artifact["estimated_input_tokens"] == 116
-        expected_user_prompt = build_extraction_prompt(
-            config.topics["revolving_door_ca"].extraction,
-            [PromptArticle("story-2", "Second title", "Second stored text")],
+        expected_user_prompt = build_screening_prompt(
+            config.topics["revolving_door_ca"],
+            [PromptArticle("story-2", "Second title", "Second stored text", 2024)],
         )
-        assert artifact["system_prompt"] == SYSTEM_PROMPT
+        assert artifact["system_prompt"] == SCREENING_SYSTEM_PROMPT
         assert artifact["user_prompt"] == expected_user_prompt
         assert output.read_text(encoding="utf-8") == (
             "SYSTEM PROMPT\n=============\n\n"
-            f"{SYSTEM_PROMPT}\n\n"
+            f"{SCREENING_SYSTEM_PROMPT}\n\n"
             "USER PROMPT\n===========\n\n"
             f"{expected_user_prompt}\n"
         )
@@ -444,7 +560,7 @@ def test_manual_request_rejects_invalid_limit_or_batch_number(
 
     config = load_config()
     config = config.model_copy(
-        update={"llm": config.llm.model_copy(update={"max_input_tokens": 150})}
+        update={"llm": config.llm.model_copy(update={"screening_max_input_tokens": 150})}
     )
     connection = init_db(tmp_path / "pipeline.db")
     monkeypatch.setattr(extract_module, "TokenEstimator", FakeManualRequestEstimator)

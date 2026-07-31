@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export PYTHONUNBUFFERED=1
+
 if (($# == 0)); then
   echo "Usage: $0 --topic TOPIC --limit N [mc-pipeline extract options]" >&2
   exit 64
@@ -46,7 +48,7 @@ mkdir -p data/logs
 log_file="data/logs/llm-analysis-$(date +%Y%m%d-%H%M%S).log"
 extract_args=("$@")
 if [[ "$has_progress_override" != true ]]; then
-  extract_args+=(--progress)
+  extract_args+=(--no-progress)
 fi
 
 {

@@ -62,10 +62,22 @@ class LLMConfig(StrictModel):
     max_requests_per_min: int = Field(gt=0)
     max_retries: int = Field(default=3, ge=0)
     max_input_tokens: int = Field(gt=0, le=200_000)
+    screening_max_input_tokens: int | None = Field(default=None, gt=0, le=200_000)
+    extraction_max_input_tokens: int | None = Field(default=None, gt=0, le=200_000)
+    extraction_max_articles_per_batch: int = Field(default=10, gt=0)
     max_output_tokens: int = Field(gt=0)
     temperature: float
     structured_output: Literal["json_schema", "json_object"]
+    screening_prompt_version: str = "screening-v1"
     prompt_version: str
+
+    @property
+    def screening_input_tokens(self) -> int:
+        return self.screening_max_input_tokens or self.max_input_tokens
+
+    @property
+    def extraction_input_tokens(self) -> int:
+        return self.extraction_max_input_tokens or self.max_input_tokens
 
 
 class QCConfig(StrictModel):
@@ -91,8 +103,10 @@ class QCConfig(StrictModel):
 class ExtractionField(StrictModel):
     name: str
     field_type: Literal["string"] = Field(alias="type")
-    required: bool
+    required: bool = False
     description: str
+    regex: str | None = None
+    allowed_values: list[str] | None = None
 
     @field_validator("name")
     @classmethod
@@ -100,6 +114,28 @@ class ExtractionField(StrictModel):
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
             raise ValueError("extraction field names must be SQL/JSON-safe identifiers")
         return name
+
+    @field_validator("regex")
+    @classmethod
+    def validate_regex(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        try:
+            re.compile(value)
+        except re.error as exc:
+            raise ValueError(f"invalid extraction field regex: {exc}") from exc
+        return value
+
+    @field_validator("allowed_values")
+    @classmethod
+    def validate_allowed_values(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return values
+        if not values:
+            raise ValueError("allowed_values must not be empty when configured")
+        if len(set(values)) != len(values):
+            raise ValueError("allowed_values must not contain duplicates")
+        return values
 
 
 class ExtractionConfig(StrictModel):

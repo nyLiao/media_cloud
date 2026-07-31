@@ -1,6 +1,7 @@
 # Secrets
 .env
 */.env
+.*cache/
 
 # Python and uv
 .venv/
@@ -18,7 +19,8 @@ dist/
 htmlcov/
 
 # Pipeline outputs
-data/
+data/*
+!data/out
 *.db
 *.db-shm
 *.db-wal

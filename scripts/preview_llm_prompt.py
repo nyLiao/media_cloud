@@ -20,7 +20,7 @@ def main() -> None:
 
     config = load_config(args.config)
     topic = config.topics[args.topic]
-    print(build_extraction_prompt(topic.extraction))
+    print(build_extraction_prompt(topic))
     print(json.dumps(build_response_json_schema(topic.extraction), indent=2))
 
 

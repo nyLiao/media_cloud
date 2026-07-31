@@ -102,18 +102,16 @@ The migration waiver below was exercised and is now **expired**.
 | C2 | `UNIQUE(story_id, prompt_version)` omitted topic, colliding across topics at the same prompt version | `story_extractions.topic` added; constraint is `UNIQUE(topic, story_id, prompt_version)` | `db.py`, `test_db.py` |
 | C3 | `NOT NULL`/`CHECK` on model-supplied columns aborted the whole batch on one bad value | Pydantic validates before insert; `validation_status` (`valid`/`invalid`/`unparsed`) + `validation_error` record rejects with zero `cases` rows | `db.py`, `contracts.py`, `test_contracts.py` |
 | C4 | `cases.case_id` was `NOT NULL UNIQUE` with no generator | `identity.build_case_id()` — deterministic `topic:story_id:prompt_version:NN`, separator-checked, never model-supplied | `identity.py`, `test_identity.py` |
-| C5 | Config, `cases` columns, and the CSV header disagreed on six fields | `contracts.case_csv_columns()` composes prefix + config fields + suffix; `cohort_period`, `previous_sector`, `current_sector` added to config; `link_category` added to topic config | `contracts.py`, `topics.yaml`, `test_contracts.py` |
-| C6 | Mapping config `required` onto the JSON Schema `required` array breaks strict mode; `previous_org`/`current_org` were required but absent from cohort rows | `required` now controls nullability in the schema and enforcement in Pydantic; conditional rules declared as `discriminator` + `required_by_discriminator` | `contracts.py`, `config.py`, `topics.yaml` |
+| C5 | Config, `cases` columns, and the CSV header drifted | `contracts.case_csv_columns()` composes provenance, configured fields, and audit columns | `contracts.py`, `topics.yaml`, `test_contracts.py` |
+| C6 | Strict-mode schemas require property keys even when extraction values are unavailable | Every configured extraction value is nullable, and Pydantic accepts missing, null, or blank values | `contracts.py`, `config.py`, `topics.yaml` |
 | C7 | A fingerprint covering "request controls" would let a `page_size` tweak re-spend quota | `identity.window_fingerprint()` accepts semantic inputs and window bounds only — it has no request-control parameter, and a test asserts passing one is a `TypeError` | `identity.py`, `test_identity.py` |
 | C8 | No `busy_timeout`; WAL plus any concurrent reader raised `database is locked` immediately | `PRAGMA busy_timeout = 5000` in `connect_db` | `db.py`, `test_db.py` |
 
 Two design points worth keeping in mind, both now enforced by tests:
 
-- **Conditional requirements are declarative.** `extraction.discriminator` names an enum field
-  and `extraction.required_by_discriminator` lists the fields each variant must supply. This is
-  what lets one strict schema serve both `individual` and `cohort` cases without the model being
-  forced to invent organizations for a cohort finding. It is generic — any topic can pick its
-  own discriminator.
+- **Extraction values remain optional.** Strict structured output requests every configured key,
+  while the response model accepts omitted, null, or blank values instead of forcing unsupported
+  details.
 - **`articles` stays global**, keyed by `story_id`. Article text is topic-independent, so two
   topics sharing a story share one fetch. Only *decisions* are topic-scoped. See §5.1.
 
@@ -226,9 +224,8 @@ Anything computed from `TopicConfig` is topic-scoped. This is the rule C1 and C2
   story IDs, attempt count, request/response/usage JSON, status, timestamps.
 - **`story_extractions`** — one relevance decision per (topic, story, prompt version), plus
   validation outcome.
-- **`cases`** — one or more findings per relevant article; supports `individual` (named person
-  and transition fields) and `cohort` (nullable person, cohort name/size/period, group claim),
-  with shared audit fields.
+- **`cases`** — one or more supported findings per relevant article, with configured extraction
+  fields and shared audit fields.
 
 Patronage-only fields from `gold_cases.csv` (party, donation values) are outside this topic's
 output contract.
@@ -497,30 +494,30 @@ def extract_topic(
 `story_extractions`, `cases`
 
 - **S4-R1** Operate only on stored text with terminal fetch status `ok`. Never fetch a URL here.
-- **S4-R2** Build the schema with `contracts.build_response_json_schema()` and the prompt
-  deterministically from topic config; hash the exact system prompt, user-template version,
-  and schema.
+- **S4-R2** Build independent screening and detailed schemas/prompts deterministically from topic
+  config; hash the phase, exact system prompt, user-template version, and schema.
 - **S4-R3** The HTTP adapter never retries internally. Stage 4 performs the configured three
   serial retries, rate-limiting every logical attempt.
 - **S4-R4** Serial requests, ≤ 30 per minute, via the shared token bucket.
-- **S4-R5** Greedily pack titled, labelled articles under configured `llm.max_input_tokens`;
-  delimit each with an immutable story ID and validate returned IDs against the batch.
+- **S4-R5** Greedily pack screening prompts under `llm.screening_max_input_tokens`. Detailed
+  prompts contain only screening-positive articles and are bounded by both
+  `llm.extraction_max_input_tokens` and `llm.extraction_max_articles_per_batch`.
 - **S4-R6** Model-provided IDs, URLs, or evidence must never update an unrelated story.
 - **S4-R7** Try strict JSON Schema; on an **explicit unsupported-format** response fall back to
   JSON-object mode with the schema inlined, and record the downgrade once. Do not downgrade on
   unrelated 400s.
-- **S4-R8** Validate every response with `contracts.build_response_model()` even when the
-  provider claims strict conformance.
+- **S4-R8** Validate every response with the phase-specific Pydantic model even when the provider
+  claims strict conformance. Every response must contain every expected story ID exactly once.
 - **S4-R9** Extracted fields, nullability, validation, prompt schema, and CSV columns come from
   `topic.extraction.fields`. The current topic uses person and transition fields only.
 - **S4-R10** Generate `case_id` with `identity.build_case_id()` (C4); never from the model.
-- **S4-R11** The model returns only relevant articles. Omitted batch IDs become terminal
-  `relevant=false` rows; invalid, ambiguous, or low-confidence output produces zero cases and is
-  not requeued.
+- **S4-R11** Screening returns one generic relevance decision per article. Detailed extraction
+  independently returns one explicit relevance decision per screened-positive article and may
+  reject it with a controlled reason; relevant results require at least one case.
 - **S4-R12** Do not request evidence quotes or confidence scores; source text and story ID remain
   the audit link for accepted rows.
-- **S4-R13** Unknown or duplicate returned IDs invalidate the attempt. Omitted IDs are valid
-  relevance rejections. Request, parse, and validation failures use the configured retry budget.
+- **S4-R13** Unknown, duplicate, or omitted IDs invalidate the attempt. Request, parse, and
+  validation failures use the configured retry budget independently for each phase.
 - **S4-R14** Record provider request IDs and usage; never headers or secrets.
 - **S4-R15** Known model names use `tiktoken`; unknown proxy model names use a conservative local
   UTF-8 approximation so dry runs never download tokenizer data.
@@ -531,9 +528,12 @@ def extract_topic(
   expanding. Requests are serial and dynamically token-packed. Exhausted failures remain
   retryable and sort behind never-attempted work on later runs. Both CSV snapshots refresh after
   each committed batch.
+- **S4-R18** Extraction values are retained when supplied and otherwise remain nullable.
+  Jurisdiction is stored as any returned string or null without enum or legality validation.
 
-**Done when:** config-shaped relevant results validate · omitted and ambiguous articles yield no
-case rows · requests remain serial · every committed batch atomically refreshes both CSVs.
+**Done when:** exact screening decisions route only positive articles into ≤10-article detailed
+batches · detailed false positives yield no cases · requests remain serial · every committed batch
+atomically refreshes both CSVs.
 
 ---
 

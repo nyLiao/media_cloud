@@ -124,11 +124,15 @@ The command writes `data/review/<topic>-fetch.csv` by default and includes the s
 article text directly. Failed or blocked fetches and raw HTML paths are excluded. Use `--output`
 to choose another path.
 
-The LLM extraction contract is generated from `topics.<name>.extraction.fields`. Prompts include
-article titles and plain labelled delimiters, return only relevant articles, and dynamically pack
-stored text below `llm.max_input_tokens`. Failed requests receive three serial retries; exhausted
-failures remain retryable at the end of later queues. Preview the exact prompt and schema
-without credentials or a network call:
+Stage 4 runs two serial structured-output phases over stored text. Screening packs articles below
+`llm.screening_max_input_tokens` and records one generic relevance boolean for every article.
+Detailed extraction then independently reviews only screening-positive articles in batches capped
+by `llm.extraction_max_articles_per_batch` and `llm.extraction_max_input_tokens`; it may reject
+screening false positives. Both phases have independent prompt versions, retries, stored
+request/response provenance, and resumable per-story state. Detailed extraction returns every
+distinct supported case individually. Configured extraction values are nullable, and jurisdiction
+is retained exactly as returned, including null or blank strings. Preview the exact prompt and
+output shape without credentials or a network call:
 
 ```bash
 uv run python scripts/preview_llm_prompt.py --topic revolving_door_ca
@@ -141,6 +145,16 @@ Rich progress bar by default in a terminal; the launcher forces it on even while
 
 ```bash
 scripts/run_llm_analysis.sh --topic revolving_door_ca --limit 25
+```
+
+To rerun **all** LLM screening and extraction for one topic, first inspect the reset plan. The
+utility does nothing until `--apply`; when applied, it creates a timestamped SQLite backup in
+`data/backups/`, resets only that topic's per-story LLM state, and calls the existing `extract`
+command for both phases:
+
+```bash
+uv run python scripts/rerun_llm_analysis.py --topic revolving_door_ca
+uv run python scripts/rerun_llm_analysis.py --topic revolving_door_ca --apply
 ```
 
 Rebuild the CSV snapshots without an LLM request using:
@@ -157,10 +171,12 @@ uv run mc-pipeline extract-prompt --topic revolving_door_ca --batch-id 16 \
   --output data/review/revolving_door_ca-batch-16-llm-prompts.txt
 ```
 
-Or preview one newly planned packed batch without credentials, network calls, or database writes:
+Or preview one newly planned screening batch without credentials, network calls, or database
+writes. Use `--phase extraction` to preview a pending detailed batch after screening decisions
+exist:
 
 ```bash
-uv run mc-pipeline extract-prompt --topic revolving_door_ca --limit 10 --batch 1
+uv run mc-pipeline extract-prompt --topic revolving_door_ca --phase screening --limit 10 --batch 1
 ```
 
 ## Development

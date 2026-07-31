@@ -26,18 +26,21 @@ llm:
   api_key_env: LLM_API_KEY
   model: "glm-5"
   timeout_s: 300
-  max_requests_per_min: 30
+  max_requests_per_min: 20
   max_retries: 3
-  max_input_tokens: 100000
+  max_input_tokens: 30000
+  screening_max_input_tokens: 30000
+  extraction_max_input_tokens: 30000
+  extraction_max_articles_per_batch: 20
   max_output_tokens: 4000
   temperature: 0
   structured_output: json_schema
-  prompt_version: v3
+  screening_prompt_version: screening-v2
+  prompt_version: v7
 
 topics:
   revolving_door_ca:
     label: "Revolving Door (Canada)"
-    # Written to cases.link_category and the CSV; not asked of the model.
     link_category: "Revolving Door"
     query: >-
       "revolving door" OR
@@ -59,8 +62,10 @@ topics:
     extraction:
       unit: person_transition
       relevance_criteria: >-
-        The article must explicitly report a high-confidence transition between a
-        public-sector organization and a private organization.
+        The article must explicitly report a high-confidence transition, in either
+        direction, between a Canadian public-sector organization or office and a
+        private-sector organization or role. Mere lobbying activity, general discussion,
+        non-Canadian transitions, public-to-public moves, and private-to-private moves are not relevant.
       fields:
         - name: person_name
           type: string
@@ -68,21 +73,34 @@ topics:
           description: "Full name of the individual."
         - name: private_org
           type: string
-          required: true
+          required: false
           description: "Private organization explicitly involved in the transition."
         - name: private_time
           type: string
           required: false
-          description: "Explicit time associated with the private role; null if unstated."
+          description: "Year or year range for the private role, when supported."
+          regex: '^\d{4}(?:-\d{4})?$'
         - name: public_org
           type: string
-          required: true
+          required: false
           description: "Public-sector organization explicitly involved in the transition."
         - name: public_time
           type: string
           required: false
-          description: "Explicit time associated with the public role; null if unstated."
+          description: "Year or year range for the public role, when supported."
+          regex: '^\d{4}(?:-\d{4})?$'
         - name: jurisdiction
           type: string
-          required: true
-          description: "Jurisdiction explicitly associated with the transition."
+          required: false
+          description: "Supported Canadian province associated with the transition."
+          allowed_values:
+            - Alberta
+            - British Columbia
+            - Manitoba
+            - New Brunswick
+            - Newfoundland and Labrador
+            - Nova Scotia
+            - Ontario
+            - Prince Edward Island
+            - Quebec
+            - Saskatchewan
