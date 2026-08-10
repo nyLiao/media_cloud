@@ -6,7 +6,7 @@ media_cloud:
   page_size: 1000
   max_pages_per_window: 50
   timeout_s: 300
-  max_retries: 0
+  max_retries: 3
 
 fetch:
   user_agent: "media-cloud-research/0.1 (+mailto:tikejar222@gwshare.com)"
@@ -24,7 +24,7 @@ fetch:
 llm:
   base_url_env: LLM_BASE_URL
   api_key_env: LLM_API_KEY
-  model: "glm-5"
+  model: "nemotron-3-super"
   timeout_s: 300
   max_requests_per_min: 20
   max_retries: 3
@@ -89,6 +89,140 @@ topics:
           required: false
           description: "Year or year range for the public role, when supported."
           regex: '^\d{4}(?:-\d{4})?$'
+        - name: jurisdiction
+          type: string
+          required: false
+          description: "Supported Canadian province associated with the transition."
+          allowed_values:
+            - Alberta
+            - British Columbia
+            - Manitoba
+            - New Brunswick
+            - Newfoundland and Labrador
+            - Nova Scotia
+            - Ontario
+            - Prince Edward Island
+            - Quebec
+            - Saskatchewan
+  patronage_ca:
+    label: "Patronage (Canada)"
+    link_category: "Patronage"
+    query: >-
+      patronage OR
+      ((donor* OR contribut* OR "campaign*" OR "spons*") AND
+      ("public*" OR "appoint*" OR "government*"))
+    start_date: 2021-01-01
+    end_date: 2025-12-31
+    collection_ids: [34411583]
+    languages: [en]
+    # An empty allowlist disables an additional domain filter. The collection scopes sources.
+    domain_allowlist: []
+    fetch_priority_title_terms: ["patronage", "donor", "contributor", "campaign contribution"]
+    qc:
+      min_title_chars: 20
+      exclude_url_patterns: ["/video/", "/live/", "/sports/", "/photo", "/tag/"]
+      # Normalized complete title terms only; "football" does not match "footballer".
+      exclude_title_terms: [hockey, football, soccer, basketball, baseball, rookie, nhl, nfl, cfl, nba, mlb]
+    extraction:
+      unit: person_transition
+      relevance_criteria: >-
+        The article must explicitly report a high-confidence connection where a
+        political donor or campaign contributor (individual or corporate) receives
+        a Canadian public-sector appointment, government contract, grant, or official
+        privilege linked to that financial support. General reporting on political
+        fundraising, routine appointments without explicit donor ties, non-Canadian
+        cases, and broad policy discussions are not relevant.
+      fields:
+        - name: person_name
+          type: string
+          required: false
+          description: "Full name of the individual."
+        - name: private_org
+          type: string
+          required: false
+          description: "Private organization explicitly involved in the transition."
+        - name: private_time
+          type: string
+          required: false
+          description: "Year or year range for the private role, when supported."
+          regex: '^\d{4}(?:-\d{4})?$'
+        - name: public_org
+          type: string
+          required: false
+          description: "Public-sector organization explicitly involved in the transition."
+        - name: public_time
+          type: string
+          required: false
+          description: "Year or year range for the public role, when supported."
+          regex: '^\d{4}(?:-\d{4})?$'
+        - name: donation_amount
+          type: string
+          required: false
+          description: "Reported amount of the political donation or campaign contribution."
+        - name: jurisdiction
+          type: string
+          required: false
+          description: "Supported Canadian province associated with the transition."
+          allowed_values:
+            - Alberta
+            - British Columbia
+            - Manitoba
+            - New Brunswick
+            - Newfoundland and Labrador
+            - Nova Scotia
+            - Ontario
+            - Prince Edward Island
+            - Quebec
+            - Saskatchewan
+  favoritism_ca:
+    label: "Favoritism (Canada)"
+    link_category: "Favoritism"
+    query: >-
+      favouritism OR favoritism OR cronyism OR
+      ((procurement OR "public*" OR "government*" OR contract) AND (lobby* OR supplier* OR vendor* OR contractor*))
+    start_date: 2021-01-01
+    end_date: 2025-12-31
+    collection_ids: [34411583]
+    languages: [en]
+    # An empty allowlist disables an additional domain filter. The collection scopes sources.
+    domain_allowlist: []
+    fetch_priority_title_terms: ["favoritism", "cronyism", "procurement", "lobby", "scandal", "contract", "vendor", "supplier"]
+    qc:
+      min_title_chars: 20
+      exclude_url_patterns: ["/video/", "/live/", "/sports/", "/photo", "/tag/"]
+      # Normalized complete title terms only; "football" does not match "footballer".
+      exclude_title_terms: [hockey, football, soccer, basketball, baseball, rookie, nhl, nfl, cfl, nba, mlb]
+    extraction:
+      unit: person_transition
+      relevance_criteria: >-
+        The article must explicitly report a high-confidence instance of Canadian
+        public-sector procurement buyers or government officials granting preferential
+        treatment, non-competitive contracts, or unfair advantages to specific private
+        suppliers, vendors, or lobbied contractors. Standard competitive bidding,
+        general lobbying activity lacking evidence of purchasing bias, non-Canadian
+        procurement, and broad critiques of government spending are not relevant.
+      fields:
+        - name: private_org
+          type: string
+          required: false
+          description: "Private supplier, vendor, or contractor receiving preferential treatment."
+        - name: person_name
+          type: string
+          required: false
+          description: "Full name of the government official or procurement buyer involved."
+        - name: public_org
+          type: string
+          required: false
+          description: "Public-sector organization or government entity awarding the contract."
+        - name: contract_time
+          type: string
+          required: false
+          description: "Year or year range of the procurement or contract award, when supported."
+          regex: '^\d{4}(?:-\d{4})?$'
+        - name: contract_amount
+          type: string
+          required: false
+          description: "Reported monetary value of the contract, tender, or procurement award."
         - name: jurisdiction
           type: string
           required: false

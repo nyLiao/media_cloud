@@ -64,6 +64,7 @@ class SearchClient(Protocol):
 
 
 ClientFactory = Callable[[str], SearchClient]
+RETRY_BACKOFF_CAP_S = 30.0
 
 
 def split_date_windows(
@@ -106,14 +107,30 @@ def _new_client(
     return client
 
 
-def _call_once(operation: Callable[[], Any], *, operation_name: str) -> Any:
-    """Call Media Cloud once so failed windows can be persisted immediately."""
-    try:
-        return operation()
-    except (APIResponseError, RequestException) as exc:
-        status = exc.response.status_code if isinstance(exc, APIResponseError) else None
-        detail = f" HTTP {status}" if status is not None else " transport error"
-        raise MediaCloudError(f"Media Cloud {operation_name} failed:{detail}.") from exc
+def _is_transient_error(exc: APIResponseError | RequestException) -> bool:
+    if isinstance(exc, RequestException):
+        return True
+    return exc.response.status_code == 429 or 500 <= exc.response.status_code < 600
+
+
+def _call_with_retries(
+    operation: Callable[[], Any],
+    *,
+    operation_name: str,
+    max_retries: int,
+) -> Any:
+    """Call Media Cloud with bounded retries for transient provider failures."""
+    for attempt in range(max_retries + 1):
+        try:
+            return operation()
+        except (APIResponseError, RequestException) as exc:
+            status = exc.response.status_code if isinstance(exc, APIResponseError) else None
+            if attempt >= max_retries or not _is_transient_error(exc):
+                detail = f" HTTP {status}" if status is not None else " transport error"
+                raise MediaCloudError(f"Media Cloud {operation_name} failed:{detail}.") from exc
+            time.sleep(min(2.0**attempt, RETRY_BACKOFF_CAP_S))
+
+    raise AssertionError("Media Cloud retry loop exhausted unexpectedly")
 
 
 def _window_inputs(
@@ -349,7 +366,12 @@ def estimate_topic(
             metadata = _window_metadata(existing["raw_json"] if existing is not None else None)
             try:
                 count = cast(
-                    Mapping[str, int], _call_once(count_operation, operation_name="story_count")
+                    Mapping[str, int],
+                    _call_with_retries(
+                        count_operation,
+                        operation_name="story_count",
+                        max_retries=config.media_cloud.max_retries,
+                    ),
                 )
             except MediaCloudError as exc:
                 mark_search_window_failed(
@@ -552,7 +574,11 @@ def search_topic(
 
                     stories, next_token = cast(
                         tuple[list[Mapping[str, Any]], str | None],
-                        _call_once(list_operation, operation_name="story_list"),
+                        _call_with_retries(
+                            list_operation,
+                            operation_name="story_list",
+                            max_retries=config.media_cloud.max_retries,
+                        ),
                     )
                     normalized: list[dict[str, Any]] = []
                     record_errors: list[dict[str, Any]] = []

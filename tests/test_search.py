@@ -5,8 +5,10 @@ import json
 from datetime import UTC, date, datetime
 from typing import Any
 
+from mediacloud.error import APIResponseError
 from pydantic import SecretStr
 from requests import ConnectionError as RequestsConnectionError
+from requests import Response
 
 from mc_pipeline.config import AppConfig, load_config
 from mc_pipeline.db import init_db
@@ -100,6 +102,12 @@ def factory_for(client: FakeClient):
         return client
 
     return factory
+
+
+def api_error(status_code: int) -> APIResponseError:
+    response = Response()
+    response.status_code = status_code
+    return APIResponseError(response, {}, {"note": "test failure"})
 
 
 def test_split_date_windows_are_closed_non_overlapping_and_include_leap_day():
@@ -267,6 +275,53 @@ def test_search_fails_once_continues_and_retries_failed_window_on_rerun(tmp_path
             "SELECT status, pagination_completed FROM search_windows ORDER BY window_start"
         ).fetchall()
         assert [tuple(row) for row in rows] == [("completed", 1), ("completed", 1)]
+    finally:
+        connection.close()
+
+
+def test_search_retries_gateway_timeouts_with_bounded_backoff(monkeypatch, tmp_path):
+    config = configured_for_test(end=date(2021, 1, 1), max_retries=6)
+    client = FakeClient(
+        pages=[([story("retried", 1)], None)],
+        failures=[api_error(504) for _ in range(6)],
+    )
+    delays: list[float] = []
+    monkeypatch.setattr("mc_pipeline.search.time.sleep", delays.append)
+    connection = init_db(tmp_path / "gateway-timeout.db")
+    try:
+        summary = search_topic(
+            config,
+            "revolving_door_ca",
+            connection,
+            api_token=SecretStr("test-token"),
+            _client_factory=factory_for(client),
+        )
+
+        assert (summary.succeeded, summary.failed) == (1, 0)
+        assert client.list_calls == 7
+        assert delays == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
+    finally:
+        connection.close()
+
+
+def test_search_does_not_retry_non_transient_api_errors(monkeypatch, tmp_path):
+    config = configured_for_test(end=date(2021, 1, 1), max_retries=3)
+    client = FakeClient(failures=[api_error(400)])
+    delays: list[float] = []
+    monkeypatch.setattr("mc_pipeline.search.time.sleep", delays.append)
+    connection = init_db(tmp_path / "bad-request.db")
+    try:
+        summary = search_topic(
+            config,
+            "revolving_door_ca",
+            connection,
+            api_token=SecretStr("test-token"),
+            _client_factory=factory_for(client),
+        )
+
+        assert (summary.succeeded, summary.failed) == (0, 1)
+        assert client.list_calls == 1
+        assert delays == []
     finally:
         connection.close()
 
